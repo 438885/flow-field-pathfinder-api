@@ -1829,7 +1829,6 @@
         }
       },
 
-      ,
       {
         name: 'Stage 23: Weighted Base Costs (2 < cost < 255) & Single-Layer loadCosts()',
         desc: 'Tests non-blocking weighted base costs via setCost(), setRect(), and setDisc() (Gravel=6, Tar=38, Quicksand=110), verifying weight-only dirty tracking (weightsDirtyChunks vs. topologyDirtyChunks), mutator cell-count return values, and single-layer hydration via grid.loadCosts(buf, 1).',
@@ -2178,7 +2177,7 @@
         }
       },
 
-      {
+{
         name: 'Stage 28: Full-State Shared Hydration, >50% Cluster Collapse & Pool/Heap Caps',
         desc: 'Constructs a 2-layer GridWorld with pre-allocated existingCosts and all optional layers (tactical, congestion+flux, anisotropy, dynamicObstacles, terrainIds, profiles, verticalPortals), round-trips via toSharedDescriptor(), triggers >50% dirty cluster full-grid collapse, and tests MinHeap doubling & FieldBufferPool caps.',
         features: [
@@ -2189,7 +2188,8 @@
         setup() {
           // 1. Construct staging GridWorld with pre-allocated existingCosts buffer & 2 layers
           const totalCells = CX * CS * CY * CS * 2;
-          const existingBuf = new Uint8Array(new SharedArrayBuffer(totalCells)).fill(COST_OPEN);
+          const BackingBuffer = typeof SharedArrayBuffer !== 'undefined' ? SharedArrayBuffer : ArrayBuffer;
+          const existingBuf = new Uint8Array(new BackingBuffer(totalCells)).fill(COST_OPEN);
           const staging = new GridWorld(CX, CY, existingBuf, { shared: true, layers: 2 });
 
           staging.useEikonal = false;
@@ -2234,10 +2234,10 @@
           const collapsedL1 = grid._buildDirtyClusters(grid.topologyDirtyChunks, 2, false, 1);
           grid.consumeDirtyState();
 
-          // 4. Test MinHeap dynamic array doubling from cap = 4 -> 16
+          // 4. Test MinHeap dynamic array doubling from cap = 4 -> 16 (backing Int32Array is `this.it`)
           const tinyHeap = new MinHeap(4);
           for (let i = 12; i >= 1; i--) tinyHeap.push(i, i * 10);
-          const heapGrewTo = tinyHeap.items.length;
+          const heapGrewTo = tinyHeap.it.length;
           const heapMin = tinyHeap.pop();
 
           // 5. Test FieldBufferPool reuse from non-empty pool, double-release guard, and maxSlabs = 1 cap
@@ -2265,7 +2265,6 @@
         update(dt) {}
       },
 
-      ,
       {
         name: 'Stage 29: Horizontal Chunk Borders (isH=true), N/S Masks & chunkB Exits',
         desc: 'Tests horizontal chunk boundaries (p.isH === true along y=15/16 between top chunks 0,1,2 and bottom chunks 3,4,5). Combines opposing N/S border masks (!canAB && !canBA), one-way N/S portals, N/S currents, and p.isH branches of portalSideCells, portalCenterCell, portalExitX/Y, and crossingCost.',
@@ -2419,62 +2418,62 @@
         }
       },
 
-      {
-        name: 'Stage 31: Oversize 2x4 Barge (minDim=2, maxDim=4) & Dual-Axis Canal Lockout',
-        desc: 'Tests a 2x4 rectangular vehicle footprint (minDim=2, maxDim=4). Decoy 1-wide trenches (clearance < 2) and 2x3 alcoves (max(cx,cy) < 4) are rejected; ChunkIntegrator locks headings to N-S or E-W along 2-cell-wide canals between 6x6 turning basins.',
+{
+        name: 'Stage 31: Oversize 2x5 Barge (minDim=2, maxDim=5) & Dual-Axis Canal Lockout',
+        desc: 'Tests a 2x5 rectangular vehicle footprint (minDim=2, maxDim=5). Decoy 2-wide trenches (clearance=1 < 2) and 4x4 alcoves (max(cx,cy)=4 < 5) are rejected; ChunkIntegrator locks headings to N-S or E-W along 4-cell-wide canals (2-cell clearance>=2 core) between 8x8 turning basins.',
         features: [
-          'Footprint { width: 2, length: 4, turnPenalty: 4.5 } (minDim=2, maxDim=4)',
-          'Dual-axis check: clearance >= 2 && (clearanceX >= 4 || clearanceY >= 4)',
-          'Axis-locked dirMasks in 2-cell-wide E-W and N-S canals'
+          'Footprint { width: 2, length: 5, turnPenalty: 4.5 } (minDim=2, maxDim=5)',
+          'Dual-axis check: clearance >= 2 && (clearanceX >= 5 || clearanceY >= 5)',
+          'Axis-locked dirMasks in 4-cell-wide E-W and N-S canals'
         ],
         setup() {
           grid = new GridWorld(CX, CY);
           grid.setRect(0, 0, 48, 32, COST_BLOCK);
 
-          // Start Basin (6x6 at x=3..8, y=4..9)
-          grid.setRect(3, 4, 6, 6, COST_OPEN);
+          // Start Basin (8x8 at x=2..9, y=2..9)
+          grid.setRect(2, 2, 8, 8, COST_OPEN);
 
-          // Decoy 1: 1-cell-wide E-W shortcut (clearance = 1 < minDim=2 -> rejected!)
-          grid.setRect(9, 6, 18, 1, COST_OPEN);
+          // Decoy 1: 2-cell-wide E-W shortcut (every cell touches a wall -> clearance = 1 < minDim=2 -> rejected!)
+          grid.setRect(10, 5, 16, 2, COST_OPEN);
 
-          // Decoy 2: 2x3 stub (clearance = 2, but clearanceX = 2 < 4 and clearanceY = 3 < 4 -> rejected!)
-          grid.setRect(12, 12, 2, 3, COST_OPEN);
+          // Decoy 2: 4x4 stub (inner cells have clearance = 2, but clearanceX = 4 < 5 and clearanceY = 4 < 5 -> rejected!)
+          grid.setRect(13, 13, 4, 4, COST_OPEN);
 
-          // Valid Canal 1: 2-cell-wide N-S canal at x=5..6 from y=4..26 (clearance=2, clearanceY >= 4)
-          grid.setRect(5, 4, 2, 23, COST_OPEN);
+          // Valid Canal 1: 4-cell-wide N-S canal at x=4..7 from y=2..29 (inner core x=5..6 has clearance=2, cx=4 < 5, cy=28 >= 5)
+          grid.setRect(4, 2, 4, 28, COST_OPEN);
 
-          // Bottom-Left Turning Basin (6x6 at x=3..8, y=22..27)
-          grid.setRect(3, 22, 6, 6, COST_OPEN);
+          // Bottom-Left Turning Basin (8x8 at x=2..9, y=22..29)
+          grid.setRect(2, 22, 8, 8, COST_OPEN);
 
-          // Valid Canal 2: 2-cell-wide E-W canal at y=24..25 from x=3..31 (clearance=2, clearanceX >= 4)
-          grid.setRect(3, 24, 29, 2, COST_OPEN);
+          // Valid Canal 2: 4-cell-wide E-W canal at y=24..27 from x=2..33 (inner core y=25..26 has clearance=2, cy=4 < 5, cx=32 >= 5)
+          grid.setRect(2, 24, 32, 4, COST_OPEN);
 
-          // Bottom-Mid Turning Basin (6x6 at x=27..32, y=22..27)
-          grid.setRect(27, 22, 6, 6, COST_OPEN);
+          // Bottom-Mid Turning Basin (8x8 at x=26..33, y=22..29)
+          grid.setRect(26, 22, 8, 8, COST_OPEN);
 
-          // Valid Canal 3: 2-cell-wide N-S canal at x=29..30 from y=5..27 (clearance=2, clearanceY >= 4)
-          grid.setRect(29, 5, 2, 23, COST_OPEN);
+          // Valid Canal 3: 4-cell-wide N-S canal at x=28..31 from y=2..29 (inner core x=29..30 has clearance=2, cx=4 < 5, cy=28 >= 5)
+          grid.setRect(28, 2, 4, 28, COST_OPEN);
 
-          // Top-Mid Turning Basin (6x6 at x=27..32, y=4..9)
-          grid.setRect(27, 4, 6, 6, COST_OPEN);
+          // Top-Mid Turning Basin (8x8 at x=26..33, y=2..9)
+          grid.setRect(26, 2, 8, 8, COST_OPEN);
 
-          // Valid Canal 4: 2-cell-wide E-W canal at y=6..7 from x=27..44 (clearance=2, clearanceX >= 4)
-          grid.setRect(27, 6, 18, 2, COST_OPEN);
+          // Valid Canal 4: 4-cell-wide E-W canal at y=4..7 from x=26..45 (inner core y=5..6 has clearance=2, cy=4 < 5, cx=20 >= 5)
+          grid.setRect(26, 4, 20, 4, COST_OPEN);
 
-          // Goal Basin (6x6 at x=39..44, y=4..9)
-          grid.setRect(39, 4, 6, 6, COST_OPEN);
+          // Goal Basin (8x8 at x=38..45, y=2..9)
+          grid.setRect(38, 2, 8, 8, COST_OPEN);
 
           grid.updateClearance(true);
 
-          const footprint = { width: 2, length: 4, turnPenalty: 4.5 };
+          const footprint = { width: 2, length: 5, turnPenalty: 4.5 };
           stageState = {
-            decoy1Walkable: grid.isWalkable(14, 6, 2, null, 0, footprint),
-            decoy2Walkable: grid.isWalkable(12, 13, 2, null, 0, footprint),
+            decoy1Walkable: grid.isWalkable(15, 5, 2, null, 0, footprint),
+            decoy2Walkable: grid.isWalkable(14, 14, 2, null, 0, footprint),
             canalWalkable: grid.isWalkable(5, 15, 2, null, 0, footprint)
           };
 
-          Object.assign(agent, { x: 6.0, y: 7.0, z: 0, vx: 0, vy: 0, profile: null, minClearance: 2, footprint, trail: [] });
-          goal = { x: 42.0, y: 7.0, z: 0 };
+          Object.assign(agent, { x: 6.0, y: 6.0, z: 0, vx: 0, vy: 0, profile: null, minClearance: 2, footprint, trail: [] });
+          goal = { x: 42.0, y: 6.0, z: 0 };
         },
         update(dt) {}
       },
@@ -2668,7 +2667,6 @@
         update(dt) {}
       },
 
-      ,
       {
         name: 'Stage 35: Profile-Filtered Portal Detection & Biome Suit Relay',
         desc: 'Chunk boundaries at x=15/16 and x=31/32 are divided into Mud (Terrain 1), Magma (Terrain 2), and Deep Water (Terrain 3) gates. Calling detectPortals(grid, 1, MAX_PORTAL_LEN, agent.profile) dynamically creates or prunes portals as the agent visits two Suit-Swap Beacons.',
@@ -2841,66 +2839,67 @@
         update(dt) {}
       },
 
-      {
+{
         name: 'Stage 38: 4-Layer Skyscraper (layers: 4) & Express Roof-to-Ground Drop',
-        desc: 'Constructs a 4-floor vertical tower (Layers 0, 1, 2, 3). Layer 0 runs SDF wall repulsion, Layer 1 runs terrain ID filtering, Layer 2 sweeps a tactical FOV scanner, and Layer 3 runs a tailwind skybridge into an express L3 -> L0 one-way drop shaft.',
+        desc: 'Constructs a 4-floor vertical tower (Layers 0, 1, 2, 3). Layer 0 runs SDF wall repulsion, Layer 1 routes around a multi-terrain bog via a stone causeway, Layer 2 uses a shadow-casting baffle against a tactical FOV scanner, and Layer 3 rides a tailwind skybridge into an L3 -> L0 drop shaft.',
         features: [
           'new GridWorld(CX, CY, null, { layers: 4 }) (24 total chunks)',
           'Per-floor subsystems on z=0 (SDF), z=1 (Terrain), z=2 (FOV), z=3 (Current)',
-          'One-way 3-story drop chute: addStairPortal(..., 3, 0, { bidirectional: false })'
+          'One-way 4-floor helical chain: L0 -> L1 -> L2 -> L3 -> L0 drop chute'
         ],
         setup() {
           grid = new GridWorld(CX, CY, null, { layers: 4 });
 
-          // Carve all 4 floors as solid first
           for (let lz = 0; lz < 4; lz++) {
             grid.setRect(0, 0, 48, 32, COST_BLOCK, lz);
           }
 
-          // Floor 0 (z=0): West entry hall (x=2..15, y=4..27) + East extraction vault (x=36..45, y=10..22)
-          grid.setRect(2, 4, 14, 24, COST_OPEN, 0);
-          grid.setDisc(8.5, 16.0, 2.2, COST_BLOCK, 0);
-          grid.setRect(36, 10, 10, 12, COST_OPEN, 0);
+          // Floor 0 (z=0): West entry hall + East extraction hall
+          grid.setRect(3, 4, 12, 24, COST_OPEN, 0);
+          grid.setDisc(8.5, 16.0, 2.0, COST_BLOCK, 0);
+          grid.setRect(35, 6, 11, 21, COST_OPEN, 0);
 
-          // Floor 1 (z=1): North corridor (x=10..30, y=4..12) with Mud bog & Stone bridge
-          grid.setRect(10, 4, 20, 9, COST_OPEN, 1);
+          // Floor 1 (z=1): North skyway
+          grid.setRect(6, 4, 26, 9, COST_OPEN, 1);
+
+          // Floor 2 (z=2): East gallery with shadow-casting baffle wall
+          grid.setRect(23, 4, 13, 24, COST_OPEN, 2);
+          grid.setRect(29, 12, 2, 6, COST_BLOCK, 2);
+
+          // Floor 3 (z=3): Penthouse skybridge
+          grid.setRect(24, 19, 19, 9, COST_OPEN, 3);
+
+          // Initialize terrainIds AFTER carving all 4 floors
           grid.ensureTerrainLayer();
-          grid.setRectTerrain(15, 4, 10, 6, 1, 1); // Mud on z=1
-          grid.setRectTerrain(15, 10, 10, 3, 2, 1); // Fast causeway on z=1
-          grid.registerProfile('tower-operative', { 0: 2, 1: 45, 2: 2 });
+          grid.setRectTerrain(13, 4, 10, 5, 1, 1);
+          grid.setRectTerrain(13, 9, 10, 4, 2, 1);
+          grid.registerProfile('tower-operative', { 0: 2, 1: 42, 2: 2 });
 
-          // Floor 2 (z=2): East gallery (x=24..36, y=5..26) with cover pillar & FOV scanner
-          grid.setRect(24, 5, 12, 22, COST_OPEN, 2);
-          grid.setRect(29, 13, 3, 5, COST_BLOCK, 2);
-
-          // Floor 3 (z=3): Penthouse skybridge (x=26..42, y=18..26) with tailwind current
-          grid.setRect(26, 18, 16, 8, COST_OPEN, 3);
           grid.currentStrength = 0.85;
-          grid.setRectCurrent(28, 19, 12, 6, 1.2, 0, 3);
+          grid.setRectCurrent(27, 20, 11, 6, 1.2, 0, 3);
 
-          // Helical stair chain: L0 -> L1 -> L2 -> L3 -> L0 (Express Drop)
-          grid.addStairPortal(12, 6, 2, 2, 0, 1, { cost: 2 });
-          grid.addStairPortal(26, 7, 2, 2, 1, 2, { cost: 2 });
-          grid.addStairPortal(28, 22, 2, 2, 2, 3, { cost: 2 });
-          grid.addStairPortal(38, 21, 2, 2, 3, 0, {
+          grid.addStairPortal(8, 6, 2, 2, 0, 1, { bidirectional: false, cost: 2 });
+          grid.addStairPortal(26, 6, 2, 2, 1, 2, { bidirectional: false, cost: 2 });
+          grid.addStairPortal(26, 23, 2, 2, 2, 3, { bidirectional: false, cost: 2 });
+          grid.addStairPortal(38, 22, 2, 2, 3, 0, {
             toX: 38,
-            toY: 15,
+            toY: 10,
             bidirectional: false,
             cost: 1
           });
 
-          grid.enableWallRepulsion({ penaltyWeight: 2.0, repulsionWeight: 0.35, radius: 2.5 });
+          grid.enableWallRepulsion({ penaltyWeight: 1.8, repulsionWeight: 0.3, radius: 2.5 });
 
           stageState = { t: 0 };
-          Object.assign(agent, { x: 4.5, y: 24.5, z: 0, vx: 0, vy: 0, profile: 'tower-operative', minClearance: 1, footprint: null, trail: [] });
-          goal = { x: 43.5, y: 16.0, z: 0 };
+          Object.assign(agent, { x: 5.5, y: 24.5, z: 0, vx: 0, vy: 0, profile: 'tower-operative', minClearance: 1, footprint: null, trail: [] });
+          goal = { x: 42.5, y: 22.5, z: 0 };
           this.update(0);
         },
         update(dt) {
           stageState.t += dt;
           grid.clearTacticalCosts();
-          const sx = 30.0 + Math.cos(stageState.t * 1.8) * 3.5;
-          grid.addTacticalFOV(sx, 11.0, 7.5, 45, true, null, 2);
+          const pulseR = 7.5 + Math.sin(stageState.t * 2.5) * 1.2;
+          grid.addTacticalFOV(33.5, 14.5, pulseR, 48, true, null, 2);
           rebuildStageField();
         }
       },
@@ -2917,32 +2916,26 @@
           grid = new GridWorld(CX, CY);
           grid.setRect(0, 0, 48, 32, COST_BLOCK);
 
-          // Entry & Exit Plazas (8x24)
           grid.setRect(2, 4, 8, 24, COST_OPEN);
           grid.setRect(38, 4, 8, 24, COST_OPEN);
 
-          // Corridor A (Top, y=5): 1-cell-wide E-W slot (cy = 1 < 3 -> full turnPen = 8.0, E-W locked)
           grid.setRect(10, 5, 28, 1, COST_OPEN);
 
-          // Corridor B (Middle, y=13..15): Exact 3-cell-wide E-W corridor (cy === maxDim (3) -> half turnPen = 4.0!)
           grid.setRect(10, 13, 28, 3, COST_OPEN);
-          // Add diagonal-forcing chicanes inside Corridor B so diagonal steps incur turnPenaltyCell
           grid.setCost(18, 13, COST_BLOCK);
           grid.setCost(24, 15, COST_BLOCK);
           grid.setCost(30, 13, COST_BLOCK);
 
-          // Corridor C (Bottom, y=21..26): 6-cell-wide boulevard (cy = 6 > maxDim -> turnPen = 0.0!)
           grid.setRect(10, 21, 28, 6, COST_OPEN);
 
           grid.updateClearance(true);
 
           const footprint = { width: 1, length: 3, turnPenalty: 8.0 };
-          // Inspect Chunk 1 (x=16..31, y=0..15) and Chunk 4 (x=16..31, y=16..31) via prepareChunk
           chunkIntegrator.prepareChunk(grid, 1, 1, null, footprint);
-          const pen1Wide = chunkIntegrator.turnPenaltyCell[5 * CS + 4];   // y=5, x=20
-          const pen3Wide = chunkIntegrator.turnPenaltyCell[14 * CS + 4];  // y=14, x=20
+          const pen1Wide = chunkIntegrator.turnPenaltyCell[5 * CS + 4];
+          const pen3Wide = chunkIntegrator.turnPenaltyCell[14 * CS + 4];
           chunkIntegrator.prepareChunk(grid, 4, 1, null, footprint);
-          const pen6Wide = chunkIntegrator.turnPenaltyCell[(23 - CS) * CS + 4]; // y=23, x=20
+          const pen6Wide = chunkIntegrator.turnPenaltyCell[(23 - CS) * CS + 4];
 
           stageState = { pen1Wide, pen3Wide, pen6Wide };
 
@@ -3015,6 +3008,430 @@
               this.benchmarkRebuild();
             }
           }
+        }
+      },
+
+{
+        name: 'Stage 41: Grand Synthesis Crucible — All 40 Stages Unified (4 Layers, 6 Phases)',
+        desc: '6-Phase, 4-Layer mega-crucible uniting all 40 stages: (P1, L0 West) 1x3 sled navigates 3-wide/1-wide turn-penalty rails, SDF pillars & weighted terrain to claim the raw Uint8Array(256) Omni-Suit; (P2, L0 Center) crosses an E-only border diode, unstamped blocked=0 gate, crowd flux & recon-discovered mines to breach the Blast-Door Terminal (triggering a rockfall + spiral rescue & dirty-cluster audit); (P3, L1) crosses a tectonic ridge, thermal tide & sniper turret shadow cover; (P4, L2) surfs a vortex current past a seeker drone & rotary bitmask valve; (P5, L3) rides a loadCosts(buf,3) penthouse jetstream into an L3->L0 roof drop chute; (P6, L0 East) takes a same-layer jump pad to the goal.',
+        features: [
+          '4-Layer Shared Descriptor Hydration + loadCosts(buf, 3) + MinHeap/BufferPool/Integrator Audit',
+          'P1-P2 (L0): 1x3 Sled Turn-Penalty Rails + SDF + Omni-Suit + Diode + blocked=0 Gate + Recon Mines + Terminal Breach',
+          'P3-P6 (L1->L2->L3->L0): Tectonic Slope + Thermal Tide + Sniper Raycast + Vortex + Seeker + Rotary Valve + Roof Drop + Jump Pad'
+        ],
+        setup() {
+          // 1. Pre-allocated 4-layer shared backing store (Layers 0, 1, 2, 3)
+          const totalCells = CX * CS * CY * CS * 4;
+          const BackingBuffer = typeof SharedArrayBuffer !== 'undefined' ? SharedArrayBuffer : ArrayBuffer;
+          const existingBuf = new Uint8Array(new BackingBuffer(totalCells)).fill(COST_BLOCK);
+          const staging = new GridWorld(CX, CY, existingBuf, { shared: true, layers: 4 });
+
+          // -------------------------------------------------------------------
+          // LAYER 0 (z = 0): West Sled Gauntlet, Center Recon Basin & East Vaults
+          // -------------------------------------------------------------------
+          staging.setRect(2, 2, 13, 28, COST_OPEN, 0);
+          // Divider across West bay (y=10..13) with 3-wide (half turn pen), 1-wide (full turn pen), and 1-cell dogleg decoy
+          staging.setRect(2, 10, 13, 4, COST_BLOCK, 0);
+          staging.setRect(4, 10, 1, 2, COST_OPEN, 0);  // Decoy dogleg (cx<3, cy<3 -> rejected for 1x3 sled)
+          staging.setRect(5, 11, 1, 3, COST_OPEN, 0);
+          staging.setRect(7, 10, 3, 4, COST_OPEN, 0);  // 3-wide channel (cx === maxDim = 3 -> half turnPenalty)
+          staging.setRect(12, 10, 1, 4, COST_OPEN, 0); // 1-wide straight rail (cx < maxDim, cy >= 28 -> full turnPenalty)
+
+          // SDF pillar & weighted base-cost patches (Tar = 42, Gravel = 6) in lower-left bay
+          staging.setDisc(8.5, 20.5, 1.5, COST_BLOCK, 0);
+          staging.setRect(10, 15, 4, 4, 42, 0);
+          staging.setRect(3, 16, 4, 4, 6, 0);
+
+          // Chunk boundary x = 15..16 on Layer 0:
+          // Top opening (y=4..7): Opposing masks (!canAB && !canBA -> suppressed portal)
+          staging.setRect(15, 4, 2, 4, COST_OPEN, 0);
+          for (let y = 4; y < 8; y++) {
+            staging.setDirectionMask(15, y, DIR_FLAGS.W, 0);
+            staging.setDirectionMask(16, y, DIR_FLAGS.E, 0);
+          }
+          // Bottom opening (y=22..27): Eastbound-only diode mask
+          staging.setRect(15, 22, 2, 6, COST_OPEN, 0);
+          for (let y = 22; y < 28; y++) {
+            staging.setDirectionMask(15, y, DIR_FLAGS.E | DIR_FLAGS.NE | DIR_FLAGS.SE, 0);
+            staging.setDirectionMask(16, y, DIR_FLAGS.E | DIR_FLAGS.NE | DIR_FLAGS.SE, 0);
+          }
+
+          // L0 Center Basin (x=17..32, y=3..29) + sealed Blast-Door alcove around L0->L1 stair (x=29..31, y=10..12)
+          staging.setRect(17, 3, 16, 27, COST_OPEN, 0);
+          staging.setRect(29, 10, 3, 3, COST_BLOCK, 0);
+
+          // L0 East Disconnected Archipelago (North-East Vault y=11..19 & South-East Goal Island y=22..29)
+          staging.setRect(35, 11, 11, 9, COST_OPEN, 0);
+          staging.setRect(35, 22, 11, 8, COST_OPEN, 0);
+
+          // -------------------------------------------------------------------
+          // LAYER 1 (z = 1): Tectonic Slope, Thermal Tide & Sniper Shadow Arena
+          // -------------------------------------------------------------------
+          staging.setRect(16, 4, 18, 14, COST_OPEN, 1);
+          staging.setRect(16, 16, 28, 12, COST_OPEN, 1);
+          // Opaque shadow-casting cover monoliths against the southern Sniper Watchtower
+          staging.setRect(22, 21, 3, 2, COST_BLOCK, 1);
+          staging.setRect(32, 21, 3, 2, COST_BLOCK, 1);
+
+          // -------------------------------------------------------------------
+          // LAYER 2 (z = 2): Vortex Basin, Seeker Patrol, Rook & Rotary Valve
+          // -------------------------------------------------------------------
+          staging.setRect(14, 5, 30, 21, COST_OPEN, 2);
+          staging.setDisc(31.0, 15.0, 2.0, COST_BLOCK, 2);
+          // Partition wall channeling L2 Westbound approach through the Rook & Rotary Valve gates (y=6..12)
+          staging.setRect(22, 13, 2, 13, COST_BLOCK, 2);
+
+          const CARD_ONLY = DIR_FLAGS.N | DIR_FLAGS.S | DIR_FLAGS.E | DIR_FLAGS.W;
+          for (let y = 6; y <= 12; y++) {
+            for (let x = 22; x <= 24; x++) {
+              staging.setDirectionMask(x, y, CARD_ONLY, 2);
+            }
+          }
+
+          // -------------------------------------------------------------------
+          // LAYER 3 (z = 3): Single-Layer loadCosts(buf, 3) Penthouse Skybridge
+          // -------------------------------------------------------------------
+          const layer3Buf = new Uint8Array(staging.layerCells).fill(COST_BLOCK);
+          for (let y = 4; y < 12; y++) {
+            for (let x = 14; x < 43; x++) {
+              layer3Buf[y * staging.width + x] = (y >= 6 && y <= 9) ? COST_OPEN : 8;
+            }
+          }
+          staging.loadCosts(layer3Buf, 3);
+
+          // -------------------------------------------------------------------
+          // Terrains, Profiles, Currents & Multi-Layer Portals
+          // -------------------------------------------------------------------
+          staging.ensureTerrainLayer();
+          staging.setRectTerrain(17, 15, 15, 6, 1, 0); // Mud bog
+          staging.setRectTerrain(17, 21, 15, 8, 2, 0); // Deep water
+          staging.registerProfile('sled-rig', { 0: 2, 1: 24, 2: 80, 4: 45, 5: 45, 6: 45 });
+
+          staging.currentStrength = 0.85;
+          staging.setRectCurrent(14, 22, 10, 6, 1.15, 0, 0); // L0 Eastbound diode boost
+          staging.setRectCurrent(16, 5, 24, 6, 1.3, 0, 3);   // L3 Penthouse tailwind jetstream
+
+          // Counter-clockwise rotational vortex current on Layer 2 around (31, 15)
+          for (let y = 6; y < 25; y++) {
+            for (let x = 24; x < 42; x++) {
+              const dx = x + 0.5 - 31.0, dy = y + 0.5 - 15.0;
+              const dist = Math.hypot(dx, dy);
+              if (dist > 2.2 && dist < 9.5) {
+                staging.setCurrent(x, y, (dy / dist) * 1.15, (-dx / dist) * 1.15, 2);
+              }
+            }
+          }
+
+          // Vertical Stair & Same-Layer Jump-Pad Portals across all 4 floors:
+          // 1. Custom 1x3 Stair Portal L0 -> L1 (initially sealed behind Blast Door until Phase 2 terminal)
+          staging.addStairPortal(30, 10, 1, 3, 0, 1, { bidirectional: false, cost: 2 });
+          // 2. Stair Portal L1 -> L2
+          staging.addStairPortal(40, 22, 2, 2, 1, 2, { bidirectional: false, cost: 2 });
+          // 3. Stair Portal L2 -> L3 Penthouse
+          staging.addStairPortal(16, 7, 2, 2, 2, 3, { bidirectional: false, cost: 2 });
+          // 4. Express One-Way Roof-to-Ground Drop Chute L3 -> L0 North-East Vault
+          staging.addStairPortal(39, 7, 2, 2, 3, 0, {
+            toX: 39,
+            toY: 13,
+            bidirectional: false,
+            cost: 1
+          });
+          // 5. Same-Layer Archipelago Jump Pad L0 Vault -> L0 Goal Island
+          staging.addStairPortal(39, 17, 2, 2, 0, 0, {
+            toX: 39,
+            toY: 24,
+            bidirectional: false,
+            cost: 1,
+            exitX: 0,
+            exitY: 1
+          });
+
+          staging.enableWallRepulsion({ penaltyWeight: 2.2, repulsionWeight: 0.35, radius: 2.6 });
+          staging.updateClearance(true);
+
+          // Round-trip all 4 layers through Shared Descriptor hydration
+          grid = GridWorld.fromSharedDescriptor(staging.toSharedDescriptor());
+          grid.congestionWeight = 2.4;
+          grid.congestionLaneWeight = 0.85;
+          grid.consumeDirtyState();
+
+          // Direct unregistered Uint8Array(256) Omni-Suit profile table
+          const omniTable = new Uint8Array(256).fill(COST_OPEN);
+          omniTable[255] = COST_BLOCK;
+          for (const tid of [1, 2, 3, 4, 5, 6]) omniTable[tid] = 2;
+
+          // Runtime API & Data-Structure Audit (MinHeap growth, FieldBufferPool reuse, ChunkIntegrator turnPenaltyCell)
+          const auditHeap = new MinHeap(4);
+          for (let i = 10; i >= 1; i--) auditHeap.push(i, i * 2);
+          const tempSlab = {
+            integration: bufferPool.allocF32(),
+            flowX: bufferPool.allocF32(),
+            flowY: bufferPool.allocF32(),
+            sourceId: bufferPool.allocI32()
+          };
+          for (let i = 0; i < CC; i++) chunkIntegrator.fleeBuf[i] = octile(i % CS, (i / CS) | 0);
+          bufferPool.releaseField(tempSlab);
+          bufferPool.releaseField(tempSlab); // Idempotent double-release guard
+
+          const sledFootprint = { width: 1, length: 3, turnPenalty: 4.0 };
+          chunkIntegrator.prepareChunk(grid, 0, 1, 'sled-rig', sledFootprint);
+          const pen3Wide = chunkIntegrator.turnPenaltyCell[11 * CS + 8];  // (x=8, y=11) -> 2.0 (half)
+          const pen1Wide = chunkIntegrator.turnPenaltyCell[11 * CS + 12]; // (x=12, y=11) -> 4.0 (full)
+
+          // Multi-layer commuter crowd arrays (L0 & L1)
+          const crowdCount = 16;
+          const cpx = new Float32Array(crowdCount);
+          const cpy = new Float32Array(crowdCount);
+          const cvx = new Float32Array(crowdCount);
+          const cvy = new Float32Array(crowdCount);
+          const cpz = new Int32Array(crowdCount);
+          for (let i = 0; i < crowdCount; i++) {
+            const onL1 = i >= 10;
+            cpz[i] = onL1 ? 1 : 0;
+            cpx[i] = onL1 ? 18 + (i % 6) * 2.2 : 17.5 + (i % 5) * 2.2;
+            cpy[i] = onL1 ? 17.5 + (i % 3) * 1.4 : 23.0 + (i % 3) * 1.5;
+            cvx[i] = onL1 ? 4.2 : 4.6;
+            cvy[i] = 0;
+          }
+
+          stageState = {
+            t: 0,
+            locked: true,
+            podPicked: false,
+            terminalUnlocked: false,
+            pod: { x: 5.5, y: 26.5, z: 0 },
+            terminal: { x: 28.5, y: 5.5, z: 0 },
+            finalGoal: { x: 43.5, y: 26.5, z: 0 },
+            omniTable,
+            omniId: grid.getProfileId(omniTable),
+            pen3Wide,
+            pen1Wide,
+            gapY: 24.5,
+            hiddenMines: [
+              { x: 20.0, y: 18.0, r: 2.3, discovered: false },
+              { x: 26.5, y: 17.5, r: 2.4, discovered: false }
+            ],
+            minesFound: 0,
+            rubbleSite: null,
+            dirtyClustersL0: [],
+            lastTopoDirty: 0,
+            lastWeightDirty: 0,
+            rescues: 0,
+            heightsL1: new Float32Array(grid.layerCells),
+            sniper: { x: 27.5, y: 26.5, r: 11.0, ray: null, locked: false },
+            stepDome: { x: 27.5, y: 19.5, r: 2.0 },
+            seeker: { x: 26.5, y: 21.5, speed: 4.1 },
+            rotorStep: -1,
+            rotorMask: DIR_FLAGS.W | DIR_FLAGS.NW | DIR_FLAGS.N,
+            crowdCount, cpx, cpy, cvx, cvy, cpz,
+            reconCells: 0,
+            maxReconDist: 0,
+            heapCap: auditHeap.it.length,
+            solveMs: 0,
+            phaseNum: 1,
+            phaseLabel: 'P1/6 (L0 West): 1x3 Sled Rails + SDF -> Omni-Suit Pod'
+          };
+
+          Object.assign(agent, {
+            x: 4.5, y: 4.5, z: 0, vx: 0, vy: 0,
+            profile: 'sled-rig', minClearance: 1, footprint: sledFootprint, trail: []
+          });
+          goal = { x: stageState.pod.x, y: stageState.pod.y, z: 0 };
+          this.update(0);
+        },
+        update(dt) {
+          stageState.t += dt;
+
+          // -------------------------------------------------------------------
+          // Phase Progression & Interactive Objectives (Pod -> Terminal -> Goal)
+          // -------------------------------------------------------------------
+          if (!stageState.podPicked && agent.z === 0 && Math.hypot(agent.x - stageState.pod.x, agent.y - stageState.pod.y) < 1.35) {
+            stageState.podPicked = true;
+            agent.footprint = null; // Uncouple 1x3 sled rig
+            agent.profile = stageState.omniTable; // Equip direct Uint8Array(256) Omni-Suit
+            goal = { x: stageState.terminal.x, y: stageState.terminal.y, z: 0 };
+          }
+
+          if (stageState.podPicked && !stageState.terminalUnlocked && agent.z === 0 &&
+              Math.hypot(agent.x - stageState.terminal.x, agent.y - stageState.terminal.y) < 1.35) {
+            stageState.terminalUnlocked = true;
+            stageState.locked = false;
+
+            // 1. Breach the Blast Door sealing the 1x3 L0->L1 stair portal
+            grid.setRect(29, 10, 3, 3, COST_OPEN, 0);
+
+            // 2. Trigger a seismic rockfall near (25, 6) & audit dirty clusters + incremental SDF/Clearance
+            const rx = 25.0, ry = 6.0, rr = 1.5;
+            grid.setDisc(rx, ry, rr, COST_BLOCK, 0);
+            stageState.rubbleSite = { x: rx, y: ry, r: rr };
+            stageState.dirtyClustersL0 = grid._buildDirtyClusters(grid.topologyDirtyChunks, 2, false, 0);
+            grid.updateWallSDF(false);
+            grid.updateClearance(false);
+
+            // Weight-only edit near terminal to verify two-tier consumeDirtyState()
+            grid.setCost(27, 5, 12, 0);
+            const dirty = grid.consumeDirtyState();
+            stageState.lastTopoDirty = dirty.topology.size;
+            stageState.lastWeightDirty = dirty.weights.size;
+
+            // Spiral Manhattan rescue if rockfall clipped the agent
+            if (!grid.isWalkable(agent.x | 0, agent.y | 0, 1, agent.profile, 0)) {
+              const safeIdx = grid.findNearestWalkable(agent.x, agent.y, 12, 1, agent.profile, 0);
+              if (safeIdx >= 0) {
+                agent.x = (safeIdx % grid.width) + 0.5;
+                agent.y = ((safeIdx / grid.width) | 0) + 0.5;
+                stageState.rescues++;
+              }
+            }
+
+            goal = { ...stageState.finalGoal };
+          }
+
+          // Update active phase label (Phases 1..6 across Layers 0..3)
+          if (!stageState.podPicked) {
+            stageState.phaseNum = 1;
+            stageState.phaseLabel = 'P1/6 (L0 West): 1x3 Sled Rails + SDF -> Omni-Suit Pod';
+          } else if (!stageState.terminalUnlocked) {
+            stageState.phaseNum = 2;
+            stageState.phaseLabel = 'P2/6 (L0 Center): Diode + blocked=0 Gate + Recon -> Terminal';
+          } else if (agent.z === 0 && agent.x < 34) {
+            stageState.phaseNum = 2;
+            stageState.phaseLabel = 'P2/6 (L0 Center): Blast Door Breached -> Climb 1x3 Stair to L1';
+          } else if (agent.z === 1) {
+            stageState.phaseNum = 3;
+            stageState.phaseLabel = 'P3/6 (L1): Tectonic Slope + Thermal Tide + Sniper Cover -> L2';
+          } else if (agent.z === 2) {
+            stageState.phaseNum = 4;
+            stageState.phaseLabel = 'P4/6 (L2): Vortex Current + Seeker Evade + Rotary Valve -> L3';
+          } else if (agent.z === 3) {
+            stageState.phaseNum = 5;
+            stageState.phaseLabel = 'P5/6 (L3): loadCosts(buf,3) Jetstream -> L3-to-L0 Drop Chute';
+          } else {
+            stageState.phaseNum = 6;
+            stageState.phaseLabel = 'P6/6 (L0 East): Archipelago Jump Pad (L0->L0) -> Goal';
+          }
+
+          // -------------------------------------------------------------------
+          // Layer 0 Dynamic Systems: Unstamped (blocked=0) Curtain & Crowd Flux
+          // -------------------------------------------------------------------
+          grid.clearDynamicObstacles();
+          for (let y = 15; y <= 28; y += 2) {
+            grid.stampDynamicObstacle(22.5, y, 1.7, 1, 0);
+          }
+          stageState.gapY = 24.5 + Math.sin(stageState.t * 1.5) * 1.8;
+          grid.stampDynamicObstacle(22.5, stageState.gapY, 3.2, 0, 0);
+
+          for (let i = 0; i < stageState.crowdCount; i++) {
+            stageState.cpx[i] += stageState.cvx[i] * dt;
+            const maxX = stageState.cpz[i] === 1 ? 31.0 : 28.5;
+            const minX = stageState.cpz[i] === 1 ? 18.0 : 17.5;
+            if (stageState.cpx[i] > maxX) stageState.cpx[i] = minX;
+          }
+          grid.setCongestionFromAgents(
+            stageState.cpx, stageState.cpy, stageState.crowdCount, 1.8,
+            stageState.cvx, stageState.cvy, stageState.cpz
+          );
+          grid.addAgentFlux(agent.x, agent.y, agent.vx, agent.vy, 0.8, agent.z);
+
+          // -------------------------------------------------------------------
+          // Layer 1 Dynamic Systems: Thermal Tide, Tectonic Ridge & Sniper FOV
+          // -------------------------------------------------------------------
+          for (let y = 5; y < 15; y++) {
+            for (let x = 17; x < 28; x++) {
+              const wave = Math.sin(x * 0.3 + stageState.t * 1.8) + Math.cos(y * 0.3 - stageState.t * 1.5);
+              const tid = wave < -0.4 ? 4 : (wave > 0.4 ? 5 : 6);
+              grid.setTerrain(x, y, tid, 1);
+            }
+          }
+
+          const W = grid.width, H = grid.height;
+          const hL1 = stageState.heightsL1;
+          const saddleY = 10.0 + Math.sin(stageState.t * 1.3) * 3.0;
+          for (let y = 4; y < 18; y++) {
+            for (let x = 16; x < 34; x++) {
+              const dx = (x - 24.0) / 4.0;
+              const dy = (y - saddleY) / 3.2;
+              hL1[y * W + x] = Math.exp(-dx * dx) * 3.2 * (1.0 - 0.75 * Math.exp(-dy * dy));
+            }
+          }
+          grid.setSlopeFromHeightmap(hL1, 1.2, 1);
+
+          // -------------------------------------------------------------------
+          // Layer 2 Dynamic Systems: Patrolling Seeker & Rotary Bitmask Valve
+          // -------------------------------------------------------------------
+          const sk = stageState.seeker;
+          if (agent.z === 2) {
+            const dx = agent.x - sk.x, dy = agent.y - sk.y, d = Math.hypot(dx, dy) || 1;
+            const nx = sk.x + (dx / d) * sk.speed * dt;
+            const ny = sk.y + (dy / d) * sk.speed * dt;
+            if (grid.isWalkable(nx | 0, ny | 0, 1, null, 2)) { sk.x = nx; sk.y = ny; }
+          } else {
+            sk.x = 28.0 + Math.cos(stageState.t * 1.2) * 5.0;
+            sk.y = 20.5 + Math.sin(stageState.t * 1.2) * 2.5;
+          }
+
+          const rStep = Math.floor(stageState.t / 0.85);
+          if (rStep !== stageState.rotorStep) {
+            stageState.rotorStep = rStep;
+            const masks = [
+              DIR_FLAGS.W | DIR_FLAGS.NW | DIR_FLAGS.N,
+              DIR_FLAGS.W | DIR_FLAGS.NW | DIR_FLAGS.SW,
+              DIR_FLAGS.W | DIR_FLAGS.SW | DIR_FLAGS.S
+            ];
+            stageState.rotorMask = masks[rStep % masks.length];
+            for (let y = 6; y <= 12; y++) {
+              for (let x = 19; x <= 21; x++) {
+                grid.setDirectionMask(x, y, stageState.rotorMask, 2);
+              }
+            }
+          }
+
+          // -------------------------------------------------------------------
+          // Tactical Overlay across Layers 0, 1, 2 (Mines + Sniper + Seeker + Recon)
+          // -------------------------------------------------------------------
+          grid.clearTacticalCosts();
+
+          // Stamp discovered radiation mines on Layer 0
+          for (const mine of stageState.hiddenMines) {
+            if (mine.discovered) {
+              grid.addTacticalDisc(mine.x, mine.y, mine.r, 85, true, 0);
+            }
+          }
+
+          // Layer 1 Sniper Watchtower FOV + hard-edge step dome + LOS raycast
+          grid.addTacticalDisc(stageState.stepDome.x, stageState.stepDome.y, stageState.stepDome.r, 46, false, 1);
+          grid.addTacticalFOV(stageState.sniper.x, stageState.sniper.y, stageState.sniper.r, 50, true, null, 1);
+          const sRay = grid.raycast(stageState.sniper.x, stageState.sniper.y, agent.x, agent.y, {
+            layer: 1,
+            maxCost: COST_BLOCK - 1
+          });
+          stageState.sniper.ray = sRay;
+          stageState.sniper.locked = (agent.z === 1 && !sRay.hit);
+
+          // Layer 2 Seeker Drone repulsion field
+          grid.addTacticalDisc(sk.x, sk.y, 4.2, 65, true, 2);
+
+          // Agent Recon Scanner (addTacticalFOV with 4-arg callback (mx, my, idx, dist))
+          let visCount = 0, maxD = 0;
+          grid.addTacticalFOV(agent.x, agent.y, 7.5, 0, false, (mx, my, idx, dist) => {
+            visCount++;
+            if (dist > maxD) maxD = dist;
+            if (agent.z === 0) {
+              for (const mine of stageState.hiddenMines) {
+                if (!mine.discovered && Math.hypot(mx - mine.x, my - mine.y) <= mine.r) {
+                  mine.discovered = true;
+                  stageState.minesFound++;
+                  grid.addTacticalDisc(mine.x, mine.y, mine.r, 85, true, 0);
+                }
+              }
+            }
+          }, agent.z);
+          stageState.reconCells = visCount;
+          stageState.maxReconDist = maxD;
+
+          const t0 = performance.now();
+          rebuildStageField();
+          stageState.solveMs = performance.now() - t0;
         }
       }
     ];
@@ -3823,7 +4240,7 @@ if (currentStageIdx === 20 && stageState.rubbleSites) {
         );
       }
 
-      if (currentStageIdx === 37) {
+if (currentStageIdx === 37) {
         const floorNames = ['L0: SDF Gauntlet', 'L1: Terrain Bog', 'L2: Tactical FOV', 'L3: Tailwind + Roof Drop'];
         drawHudBanner(
           `4-Story Tower [Floor ${agent.z}/3 - ${floorNames[agent.z]}] | Total Chunks: ${grid.chunkCount}`,
@@ -3850,6 +4267,228 @@ if (currentStageIdx === 20 && stageState.rubbleSites) {
           '#56d364'
         );
       }
+
+if (currentStageIdx === 40 && stageState.phaseLabel) {
+        // Layer 0 Overlays: Omni-Suit Pod, Blast-Door Terminal, Dirty Clusters, Unstamped Gate, Mines, Crowd & Jump Pad
+        if (z === 0) {
+          if (!stageState.podPicked) {
+            const px = stageState.pod.x * CELL_PX, py = stageState.pod.y * CELL_PX;
+            ctx.fillStyle = '#39c5bb';
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1.5;
+            ctx.fillRect(px - 6, py - 6, 12, 12);
+            ctx.strokeRect(px - 6, py - 6, 12, 12);
+          }
+
+          // Blast-Door Terminal at (28.5, 5.5)
+          const tx = stageState.terminal.x * CELL_PX, ty = stageState.terminal.y * CELL_PX;
+          ctx.fillStyle = stageState.terminalUnlocked ? '#3fb950' : '#d29922';
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.5;
+          ctx.fillRect(tx - 6, ty - 6, 12, 12);
+          ctx.strokeRect(tx - 6, ty - 6, 12, 12);
+
+          // Dirty cluster bounding box & seismic rockfall ring after terminal breach
+          for (const cl of stageState.dirtyClustersL0) {
+            ctx.strokeStyle = 'rgba(57, 197, 187, 0.75)';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 3]);
+            ctx.strokeRect(cl.x0 * CELL_PX, cl.y0 * CELL_PX, (cl.x1 - cl.x0 + 1) * CELL_PX, (cl.y1 - cl.y0 + 1) * CELL_PX);
+            ctx.setLineDash([]);
+          }
+          if (stageState.rubbleSite) {
+            ctx.strokeStyle = '#8b949e';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(stageState.rubbleSite.x * CELL_PX, stageState.rubbleSite.y * CELL_PX, stageState.rubbleSite.r * CELL_PX, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+
+          // Unstamped blocked=0 safe passage ring at (22.5, gapY)
+          ctx.strokeStyle = '#3fb950';
+          ctx.lineWidth = 1.6;
+          ctx.beginPath();
+          ctx.arc(22.5 * CELL_PX, stageState.gapY * CELL_PX, 3.2 * CELL_PX, 0, Math.PI * 2);
+          ctx.stroke();
+
+          // Hidden / Discovered Radiation Mines
+          for (const mine of stageState.hiddenMines) {
+            ctx.strokeStyle = mine.discovered ? '#f85149' : 'rgba(255, 255, 255, 0.22)';
+            ctx.lineWidth = mine.discovered ? 1.8 : 1;
+            ctx.beginPath();
+            ctx.arc(mine.x * CELL_PX, mine.y * CELL_PX, mine.r * CELL_PX, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+
+          // Same-layer Archipelago Jump Pad vector arrow
+          for (const vp of grid.verticalPortals) {
+            if (vp.layerA === 0 && vp.layerB === 0) {
+              const xA = (vp.centerA % W + 0.5) * CELL_PX, yA = (((vp.centerA / W) | 0) + 0.5) * CELL_PX;
+              const xB = (vp.centerB % W + 0.5) * CELL_PX, yB = (((vp.centerB / W) | 0) + 0.5) * CELL_PX;
+              ctx.strokeStyle = '#d2a8ff';
+              ctx.lineWidth = 1.6;
+              drawArrow(xA, yA, xB, yB, 4);
+            }
+          }
+        }
+
+        // Layer 1 Overlays: Sniper Watchtower LOS Raycast, Step Dome & Tectonic Ridge Shading
+        if (z === 1) {
+          for (let y = 4; y < 18; y++) {
+            for (let x = 16; x < 34; x++) {
+              const hVal = stageState.heightsL1[y * W + x];
+              if (hVal > 0.4) {
+                ctx.fillStyle = `rgba(175, 184, 193, ${clamp(hVal / 5.5, 0.05, 0.35)})`;
+                ctx.fillRect(x * CELL_PX, y * CELL_PX, CELL_PX, CELL_PX);
+              }
+            }
+          }
+          const sd = stageState.stepDome;
+          ctx.strokeStyle = '#ff7b72';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(sd.x * CELL_PX, sd.y * CELL_PX, sd.r * CELL_PX, 0, Math.PI * 2);
+          ctx.stroke();
+
+          const sn = stageState.sniper;
+          ctx.fillStyle = sn.locked ? '#f85149' : '#d29922';
+          ctx.beginPath();
+          ctx.arc(sn.x * CELL_PX, sn.y * CELL_PX, 5.5, 0, Math.PI * 2);
+          ctx.fill();
+          if (sn.ray) {
+            ctx.strokeStyle = sn.locked ? '#f85149' : 'rgba(210, 153, 34, 0.5)';
+            ctx.lineWidth = sn.locked ? 2 : 1.2;
+            ctx.beginPath();
+            ctx.moveTo(sn.x * CELL_PX, sn.y * CELL_PX);
+            ctx.lineTo(sn.ray.x * CELL_PX, sn.ray.y * CELL_PX);
+            ctx.stroke();
+          }
+        }
+
+        // Layer 2 Overlays: Seeker Drone, Rotary Bitmask Valve & Rook Lattice
+        if (z === 2) {
+          const sk = stageState.seeker;
+          ctx.fillStyle = '#f85149';
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(sk.x * CELL_PX, sk.y * CELL_PX, 6, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.strokeStyle = '#e3b341';
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(19 * CELL_PX, 6 * CELL_PX, 3 * CELL_PX, 7 * CELL_PX);
+          ctx.strokeStyle = '#58a6ff';
+          ctx.strokeRect(22 * CELL_PX, 6 * CELL_PX, 3 * CELL_PX, 7 * CELL_PX);
+        }
+
+        // Render commuter crowd agents on current layer (L0 & L1)
+        for (let i = 0; i < stageState.crowdCount; i++) {
+          if (stageState.cpz[i] === z) {
+            ctx.fillStyle = '#79c0ff';
+            ctx.fillRect(stageState.cpx[i] * CELL_PX - 2.5, stageState.cpy[i] * CELL_PX - 2.5, 5, 5);
+          }
+        }
+
+        drawHudBanner(
+          `${stageState.phaseLabel} | Floor: L${agent.z}/3 | Mines:${stageState.minesFound}/2 | Solve:${stageState.solveMs.toFixed(2)}ms`,
+          '#e3b341'
+        );
+      }
+
+      // 5. Render Goal Target Reticle (Crisp Technical Crosshair + Ring)
+      const gx = goal.x * CELL_PX, gy = goal.y * CELL_PX;
+      ctx.strokeStyle = '#e3b341';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.arc(gx, gy, 7, 0, Math.PI * 2);
+      ctx.moveTo(gx - 10, gy); ctx.lineTo(gx + 10, gy);
+      ctx.moveTo(gx, gy - 10); ctx.lineTo(gx, gy + 10);
+      ctx.stroke();
+      ctx.fillStyle = '#e3b341';
+      ctx.beginPath();
+      ctx.arc(gx, gy, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 6. Render Agent Trail, LOS Ray & Oriented Technical Agent Marker
+      const ray = grid.raycast(agent.x, agent.y, goal.x, goal.y, {
+        layer: agent.z,
+        minClearance: agent.minClearance,
+        profile: agent.profile
+      });
+
+      if (showLos) {
+        if (agent.trail.length > 1) {
+          ctx.strokeStyle = 'rgba(63, 185, 80, 0.75)';
+          ctx.lineWidth = 1.8;
+          ctx.beginPath();
+          for (let i = 0; i < agent.trail.length; i++) {
+            const pt = agent.trail[i];
+            if (i === 0) ctx.moveTo(pt.x * CELL_PX, pt.y * CELL_PX);
+            else ctx.lineTo(pt.x * CELL_PX, pt.y * CELL_PX);
+          }
+          ctx.stroke();
+        }
+
+        ctx.strokeStyle = ray.hit ? 'rgba(248, 81, 73, 0.45)' : 'rgba(63, 185, 80, 0.7)';
+        ctx.lineWidth = 1.2;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(agent.x * CELL_PX, agent.y * CELL_PX);
+        ctx.lineTo(ray.x * CELL_PX, ray.y * CELL_PX);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Draw Agent-01 with directional heading chevron & optional rectangular vehicle footprint
+      const ax = agent.x * CELL_PX, ay = agent.y * CELL_PX;
+      if (Math.hypot(agent.vx, agent.vy) > 0.25) {
+        agent.heading = Math.atan2(agent.vy, agent.vx);
+      }
+
+      if (agent.footprint) {
+        ctx.strokeStyle = '#7ee787';
+        ctx.lineWidth = 1.4;
+        const fw = agent.footprint.width * CELL_PX * 0.72;
+        const fl = agent.footprint.length * CELL_PX * 0.72;
+        ctx.strokeRect(ax - fw * 0.5, ay - fl * 0.5, fw, fl);
+      }
+
+      ctx.save();
+      ctx.translate(ax, ay);
+      ctx.rotate(agent.heading || 0);
+      ctx.fillStyle = '#2ea043';
+      ctx.strokeStyle = '#f0f6fc';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(0, 0, 6.2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.moveTo(5.2, 0);
+      ctx.lineTo(-2.5, -3.2);
+      ctx.lineTo(-1.2, 0);
+      ctx.lineTo(-2.5, 3.2);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+
+      // Update telemetry panel (cleanly formatting direct Uint8Array(256) profiles)
+      const cIdx = grid.index(clamp(agent.x | 0, 0, W - 1), clamp(agent.y | 0, 0, H - 1), agent.z);
+      const distVal = field.integration[cIdx];
+      const profDisplay = agent.profile instanceof Uint8Array
+        ? `Uint8Array(256) #${grid.getProfileId(agent.profile)}`
+        : (agent.profile || 'default');
+      document.getElementById('telPos').textContent = `(${agent.x.toFixed(1)}, ${agent.y.toFixed(1)}, L${agent.z})`;
+      document.getElementById('telVel').textContent = `(${agent.vx.toFixed(1)}, ${agent.vy.toFixed(1)}) [${simSpeed}×]`;
+      document.getElementById('telProf').textContent = `${profDisplay} / clr:${agent.minClearance}`;
+      document.getElementById('telDist').textContent = Number.isFinite(distVal) ? distVal.toFixed(2) : '∞';
+      document.getElementById('telRay').textContent = ray.hit ? `Blocked @ ${ray.distance.toFixed(1)}m` : `Clear (${ray.distance.toFixed(1)}m)`;
+      document.getElementById('telPortals').textContent = `${portals.length} active`;
+      document.getElementById('telTime').textContent = `${stageTime.toFixed(1)}s`;
+    }
 
       // 5. Render Goal Target Reticle (Crisp Technical Crosshair + Ring)
       const gx = goal.x * CELL_PX, gy = goal.y * CELL_PX;
