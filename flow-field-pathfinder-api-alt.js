@@ -1,4 +1,4 @@
-// flow-field-pathfinder-api.js (v2.0)
+// flow-field-pathfinder-api-alt.js
 
 //#region 1: Constants & Math Utilities
 /** @constant {number} Chunk width/height in cells (16x16) */
@@ -52,7 +52,7 @@ export const octile = (dx, dy) => {
 const hashMix = (h, v) => Math.imul((h ^ (v | 0)) >>> 0, 16777619) >>> 0;
 //#endregion
 
-//#region 2: 4-Ary Cache-Friendly Min-Heap & Slab Buffer Pool (#B4, #B5)
+//#region 2: 4-Ary Cache-Friendly Min-Heap (#B5)
 /**
  * #B5: TypedArray-backed 4-ary min-heap for Eikonal, Dijkstra, and A* searches.
  * Halves tree depth and improves CPU cache-line locality during sift-down.
@@ -80,7 +80,8 @@ export class MinHeap {
     it[c] = item; k[c] = key;
   }
   pop() {
-    let { it, k } = this, top = it[0], li = --this.sz, item = it[li], key = k[li], p = 0, ch;
+    let { it, k } = this, top = it[0], li = --this.sz, item = k[li], key = k[li], p = 0, ch;
+    item = it[li];
     this.lastKey = k[0];
     while ((ch = (p << 2) + 1) < li) {
       let mc = ch, mk = k[ch];
@@ -95,7 +96,9 @@ export class MinHeap {
     return top;
   }
 }
+//#endregion
 
+//#region 3: Zero-Allocation Slab Buffer Pool (#B4)
 /**
  * #B4: Zero-allocation slab pool for recycling chunk-sized TypedArrays on cache eviction.
  */
@@ -126,7 +129,7 @@ export class FieldBufferPool {
 }
 //#endregion
 
-//#region 3: Multi-Layer Chunked Cost Grid
+//#region 4: GridWorld Core & Dirty State Tracking (#B1)
 /**
  * 2D chunked cost grid supporting static costs, two-tier dirty tracking (#B1),
  * localized dirty-halo SDF & clearance updates (#B2), tactical FOV shadowcasting (#E1),
@@ -339,8 +342,9 @@ export class GridWorld {
     this.weightsDirtyChunks.clear();
     return { topology, weights, all };
   }
+//#endregion
 
-  // #D4: Terrain ID Layer & Unit Cost Profiles
+//#region 5: Terrain ID Layer & Unit Cost Profiles (#D4)
   ensureTerrainLayer() {
     if (!this.terrainIds) this.terrainIds = new Uint8Array(this.width * this.height);
     return this.terrainIds;
@@ -376,8 +380,9 @@ export class GridWorld {
       for (let xx = x0; xx < x1; xx++) this.setTerrain(xx, yy, terrainId);
     }
   }
+//#endregion
 
-  // #C3: Dynamic Moving Obstacle Stamp Layer
+//#region 6: Dynamic Moving Obstacle Stamp Layer (#C3)
   ensureDynamicObstacleLayer() {
     if (!this.dynamicObstacles) this.dynamicObstacles = new Uint8Array(this.width * this.height);
     return this.dynamicObstacles;
@@ -415,8 +420,9 @@ export class GridWorld {
     }
     this.hasDynamicObstacles = false;
   }
+//#endregion
 
-  // #4 & #B2: Wall Repulsion / Signed Distance Field with Dirty-Halo Regional Update
+//#region 7: Wall Repulsion & Signed Distance Field (SDF) (#4, #B2)
   enableWallRepulsion({ penaltyWeight = 1.5, repulsionWeight = 0.35, radius = 2.5 } = {}) {
     this.wallPenaltyWeight = penaltyWeight;
     this.wallRepulsionWeight = repulsionWeight;
@@ -494,8 +500,9 @@ export class GridWorld {
     this._sdfRect.x0 = this._sdfRect.y0 = len;
     this._sdfRect.x1 = this._sdfRect.y1 = -1;
   }
+//#endregion
 
-  // #5 & #B2: Clearance Map with Dirty-Halo Regional Brushfire Update
+//#region 8: Clearance Map & Regional Brushfire (#5, #B2)
   updateClearance(forceFull = false) {
     const { width: W, height: H, costs } = this, len = W * H;
     if (!this.clearance) {
@@ -543,8 +550,9 @@ export class GridWorld {
     this._clearanceRect.x0 = this._clearanceRect.y0 = len;
     this._clearanceRect.x1 = this._clearanceRect.y1 = -1;
   }
+//#endregion
 
-  // #6 & #E1: Tactical Overlay & Wall-Occluded FOV Shadowcasting
+//#region 9: Tactical Overlay, FOV Shadowcasting & Raycasting (#6, #E1)
   ensureTacticalLayer() {
     if (!this.tacticalCosts) this.tacticalCosts = new Float32Array(this.width * this.height);
     this.hasTactical = true;
@@ -679,8 +687,9 @@ export class GridWorld {
       if (e2 < dx) { err += dx; cy += sy; }
     }
   }
+//#endregion
 
-  // #9 & #C1: Continuum Crowd Congestion + Anisotropic Velocity-Flux Layer
+//#region 10: Continuum Crowd Congestion & Velocity-Flux Layer (#9, #C1)
   ensureCongestionLayer(withFlux = false) {
     const len = this.width * this.height;
     if (!this.congestion) this.congestion = new Float32Array(len);
@@ -753,8 +762,9 @@ export class GridWorld {
     this.hasCongestion = active;
     if (!active) this.hasCongestionFlux = false;
   }
+//#endregion
 
-  // #11 & #A5: Anisotropic Directional Passability & Currents / Slopes
+//#region 11: Anisotropic Passability, Vector Currents & Nearest Walkable (#11, #A5)
   ensureAnisotropicLayer() {
     const len = this.width * this.height;
     if (!this.dirMask) this.dirMask = new Uint8Array(len).fill(DIR_FLAGS.ALL);
@@ -837,7 +847,7 @@ export class GridWorld {
 }
 //#endregion
 
-//#region 4: Portal Detection & Multi-Mode Chunk Integrator (#A2, #A5, #C1, #D4)
+//#region 12: Chunk Boundary Portal Detection & Crossing Costs (#A2, #A5, #D4)
 /**
  * #A2 & #A5: Detects chunk boundary portals, splitting wide runs (> `maxPortalLen`) into sub-portals
  * and checking anisotropic directional masks across chunk borders.
@@ -890,7 +900,6 @@ export function detectPortals(grid, minClearance = 1, maxPortalLen = MAX_PORTAL_
             if (run < 0) run = t;
           } else if (run >= 0) {
             const totalLen = t - run;
-            // #A2: Split wide portals into balanced sub-portals of at most `maxPortalLen`
             const splits = maxPortalLen > 0 ? Math.ceil(totalLen / maxPortalLen) : 1;
             let cur = run;
             for (let s = 0; s < splits; s++) {
@@ -931,10 +940,12 @@ export const crossingCost = (grid, p, fromChunk = p.chunkA, profile = null) => {
   }
   return cost;
 };
+//#endregion
 
+//#region 13: Multi-Mode Eikonal & Flee Chunk Integrator (#1, #A5, #C1, #I1)
 /**
  * Multi-mode chunk integrator supporting:
- * - #1 & #A5: Per-cell Eikonal quadratic upwind solver (compatible with localized anisotropy)
+ * - #1, #A5 & #I1: Float32 per-cell Eikonal quadratic upwind solver
  * - #2: Multi-source geodesic Voronoi (`sourceOut`)
  * - #4: Wall SDF penalty buffer
  * - #5: Clearance filtering (`minClearance`)
@@ -953,7 +964,7 @@ export class ChunkIntegrator {
   curY = new Float32Array(CC);
   fluxX = new Float32Array(CC);
   fluxY = new Float32Array(CC);
-  dist = new Float64Array(CC);
+  dist = new Float32Array(CC);
   fleeBuf = new Float32Array(CC);
 
   prepareChunk(grid, chunkId, minClearance = 1, profile = null) {
@@ -1065,7 +1076,6 @@ export class ChunkIntegrator {
           }
         }
 
-        // #C1: Anisotropic Velocity-Flux Congestion (counter-flow penalty / co-flow discount)
         if (hasFlux) {
           const fx = fluxX[fromCell], fy = fluxY[fromCell];
           if (fx !== 0 || fy !== 0) {
@@ -1077,7 +1087,6 @@ export class ChunkIntegrator {
 
         let nd = du + DL[d] * stepScale;
 
-        // #1 & #A5: Per-cell Eikonal quadratic upwind refinement (active on all non-one-way cells)
         if (useEikonal && !isMasked) {
           const tx = Math.min(
             nx > 0 ? dist[ny * CS + nx - 1] : Infinity,
@@ -1130,13 +1139,14 @@ export class ChunkIntegrator {
 }
 //#endregion
 
-//#region 5: Portal Graph, Connected Components & Macro / Swarm Pathfinder (#B1, #B3, #D1)
+//#region 14: Abstract Portal Graph, Tarjan SCC & Traffic Throttling (#B1, #D1, #G4, #H2)
 /**
  * High-level abstract graph connecting chunk boundary portals in CSR format.
  * Supports:
  * - #A2: Multi-cell portal span evaluation
- * - #B1: In-place CSR weight refreshes (`refreshWeights`) without rebuilding topology
- * - #D1: Connected component labeling (`portalComp`) for $O(1)$ reachability checks
+ * - #B1 & #I1: Flat Float32 CSR & in-place weight refreshes (`refreshWeights`)
+ * - #D1 & #H2: Undirected components (`portalComp`) + Tarjan's Directed SCC & 64-Bit DAG Reachability Bitsets
+ * - #G4: Dynamic Portal Flux Throttling (`portalTraffic`) for Wardrop traffic load-balancing
  */
 export class PortalGraph {
   constructor(grid, prevGraph = null, dirtyChunks = null, minClearance = 1, profile = null) {
@@ -1153,13 +1163,19 @@ export class PortalGraph {
     }
     const chunkPortals = this.chunkPortals = lists.map(l => new Int32Array(l));
     const canReuse = prevGraph && prevGraph.minClearance === minClearance && prevGraph.profile === profile && dirtyChunks;
+
+    // #I1: Float32 cached intra-chunk rows
     this.chunkDistCache = Array.from({ length: grid.chunkCount }, (_, c) =>
       canReuse && !dirtyChunks.has(c) ? prevGraph.chunkDistCache[c] : new Map()
     );
 
+    // #G4: Real-time portal traffic flux counters for Wardrop load-balancing
+    this.portalTraffic = new Float32Array(P);
+    this.trafficWeight = 1.25;
+
     const adj = Array.from({ length: P }, () => []);
     const it = this._it = new ChunkIntegrator();
-    const field = this._field = new Float64Array(CC);
+    const field = this._field = new Float32Array(CC);
     const itOpts = { minClearance, profile };
 
     for (let c = 0; c < grid.chunkCount; c++) {
@@ -1175,7 +1191,7 @@ export class PortalGraph {
         if (!row) {
           const seeds = portalSideCells(pA, c).map(cell => grid.localIndex(cell));
           it.integrate(grid, c, seeds, field, itOpts);
-          row = new Float64Array(field);
+          row = new Float32Array(field);
           cCache.set(locA, row);
         }
         for (let ib = 0; ib < ids.length; ib++) {
@@ -1193,20 +1209,21 @@ export class PortalGraph {
     const E = adj.reduce((acc, a) => acc + a.length, 0);
     this.edgeOffsets = new Int32Array(P + 1);
     this.edgeTargets = new Int32Array(E);
-    this.edgeCosts = new Float64Array(E);
+    this.baseEdgeCosts = new Float32Array(E);
+    this.edgeCosts = new Float32Array(E);
     this.edgeChunks = new Int32Array(E);
     for (let p = 0, e = 0; p < P; this.edgeOffsets[++p] = e) {
       for (let k = 0; k < adj[p].length; k++) {
         const edge = adj[p][k];
-        this.edgeTargets[e] = edge.to; this.edgeCosts[e] = edge.cost; this.edgeChunks[e++] = edge.chunk;
+        this.edgeTargets[e] = edge.to;
+        this.baseEdgeCosts[e] = this.edgeCosts[e] = edge.cost;
+        this.edgeChunks[e++] = edge.chunk;
       }
     }
 
-    // Build reverse CSR for #B3 (Global Reverse-Dijkstra Swarm Field) & #D1 (Components)
     this._buildReverseAndComponents();
   }
 
-  /** #A2: Evaluates multi-sampled distance across a portal's cells (blending min and center) */
   _samplePortalRowDist(row, pB, chunk) {
     const cells = portalSideCells(pB, chunk), { grid } = this;
     const centerD = row[pLocal(grid, pB, chunk)];
@@ -1235,7 +1252,7 @@ export class PortalGraph {
       }
     }
 
-    // #D1: Connected Component Labeling via undirected BFS over portals
+    // #D1: Undirected Connected Component Labeling
     const comp = this.portalComp = new Int32Array(P).fill(-1);
     const queue = new Int32Array(P);
     let compId = 0;
@@ -1258,12 +1275,121 @@ export class PortalGraph {
       compId++;
     }
     this.componentCount = compId;
+
+    // #H2: Tarjan's Strongly Connected Components (SCC) & 64-Bit DAG Reachability Signatures
+    const scc = this.portalScc = new Int32Array(P).fill(-1);
+    const disc = new Int32Array(P).fill(-1), low = new Int32Array(P);
+    const onStack = new Uint8Array(P), stack = new Int32Array(P);
+    const callNode = new Int32Array(P), callEdge = new Int32Array(P);
+    let timer = 0, sTop = 0, sccCnt = 0;
+
+    for (let i = 0; i < P; i++) {
+      if (disc[i] !== -1) continue;
+      let cTop = 0;
+      callNode[0] = i;
+      callEdge[0] = this.edgeOffsets[i];
+      disc[i] = low[i] = timer++;
+      stack[sTop++] = i;
+      onStack[i] = 1;
+
+      while (cTop >= 0) {
+        const u = callNode[cTop], e = callEdge[cTop];
+        if (e < this.edgeOffsets[u + 1]) {
+          callEdge[cTop] = e + 1;
+          const v = this.edgeTargets[e];
+          if (disc[v] === -1) {
+            cTop++;
+            callNode[cTop] = v;
+            callEdge[cTop] = this.edgeOffsets[v];
+            disc[v] = low[v] = timer++;
+            stack[sTop++] = v;
+            onStack[v] = 1;
+          } else if (onStack[v] && disc[v] < low[u]) {
+            low[u] = disc[v];
+          }
+        } else {
+          if (low[u] === disc[u]) {
+            while (sTop > 0) {
+              const w = stack[--sTop];
+              onStack[w] = 0;
+              scc[w] = sccCnt;
+              if (w === u) break;
+            }
+            sccCnt++;
+          }
+          cTop--;
+          if (cTop >= 0) {
+            const pNode = callNode[cTop];
+            if (low[u] < low[pNode]) low[pNode] = low[u];
+          }
+        }
+      }
+    }
+
+    this.sccCount = sccCnt;
+    const rLo = this.sccReachLo = new Uint32Array(sccCnt);
+    const rHi = this.sccReachHi = new Uint32Array(sccCnt);
+    for (let s = 0; s < sccCnt; s++) {
+      const bit = s & 63;
+      if (bit < 32) rLo[s] = 1 << bit;
+      else rHi[s] = 1 << (bit - 32);
+    }
+    // Tarjan emits SCCs in reverse topological order (0 = sink, sccCnt-1 = source)
+    for (let u = 0; u < P; u++) {
+      const su = scc[u];
+      for (let e = this.edgeOffsets[u]; e < this.edgeOffsets[u + 1]; e++) {
+        const sv = scc[this.edgeTargets[e]];
+        if (su !== sv) {
+          rLo[su] |= rLo[sv];
+          rHi[su] |= rHi[sv];
+        }
+      }
+    }
+    // Second sweep to propagate multi-hop DAG reachability
+    for (let s = 0; s < sccCnt; s++) {
+      for (let u = 0; u < P; u++) {
+        if (scc[u] !== s) continue;
+        for (let e = this.edgeOffsets[u]; e < this.edgeOffsets[u + 1]; e++) {
+          const sv = scc[this.edgeTargets[e]];
+          rLo[s] |= rLo[sv];
+          rHi[s] |= rHi[sv];
+        }
+      }
+    }
   }
 
-  /**
-   * #B1: Surgical in-place refresh of CSR edge costs for chunks with modified weights
-   * (congestion, tactical costs, currents, non-blocking terrain edits).
-   */
+  /** #G4: Records agent traversal across a portal to throttle overcrowded bottlenecks */
+  addPortalTraffic(portalId, amount = 1.0) {
+    if (portalId < 0 || portalId >= this.portals.length) return;
+    const p = this.portals[portalId], cap = Math.max(1, p.cellsA.length);
+    this.portalTraffic[portalId] += amount / cap;
+    const surcharge = this.portalTraffic[portalId] * this.trafficWeight;
+    for (let r = this.revOffsets[portalId]; r < this.revOffsets[portalId + 1]; r++) {
+      const e = this.revEdgeIdx[r];
+      this.edgeCosts[e] = this.baseEdgeCosts[e] + surcharge;
+    }
+  }
+
+  /** #G4: Decays real-time portal traffic congestion surcharges */
+  decayPortalTraffic(decayFactor = 0.85, eps = 0.02) {
+    const T = this.portalTraffic, P = T.length;
+    let changed = false;
+    for (let p = 0; p < P; p++) {
+      if (T[p] > 0) {
+        T[p] *= decayFactor;
+        if (T[p] < eps) T[p] = 0;
+        const surcharge = T[p] * this.trafficWeight;
+        for (let r = this.revOffsets[p]; r < this.revOffsets[p + 1]; r++) {
+          const e = this.revEdgeIdx[r];
+          this.edgeCosts[e] = this.baseEdgeCosts[e] + surcharge;
+        }
+        changed = true;
+      }
+    }
+    if (changed) this.weightVersion++;
+    return changed;
+  }
+
   refreshWeights(dirtyChunks) {
     const { grid, portals, chunkPortals, minClearance, profile, _it: it, _field: field } = this;
     const itOpts = { minClearance, profile };
@@ -1276,7 +1402,7 @@ export class PortalGraph {
         const idA = ids[ia], pA = portals[idA], locA = pLocal(grid, pA, c);
         const seeds = portalSideCells(pA, c).map(cell => grid.localIndex(cell));
         it.integrate(grid, c, seeds, field, itOpts);
-        cCache.set(locA, new Float64Array(field));
+        cCache.set(locA, new Float32Array(field));
       }
       for (let ib = 0; ib < ids.length; ib++) {
         const idB = ids[ib], pB = portals[idB];
@@ -1286,18 +1412,19 @@ export class PortalGraph {
           const row = cCache.get(pLocal(grid, pA, c));
           const crossA = crossingCost(grid, pA, c, profile);
           const d = row ? this._samplePortalRowDist(row, pB, c) : Infinity;
-          this.edgeCosts[e] = d + crossA;
+          this.baseEdgeCosts[e] = d + crossA;
+          this.edgeCosts[e] = this.baseEdgeCosts[e] + this.portalTraffic[idA] * this.trafficWeight;
         }
       }
     }
     this.weightVersion++;
   }
 }
+//#endregion
 
+//#region 15: Hierarchical Macro Pathfinder, SSFA Funnel & Swarm Broadcast (#B3, #F5)
 /**
- * Hierarchical A* & Swarm Broadcast Pathfinder operating over `PortalGraph`.
- * Supports single goals, Multi-Source Geodesic Voronoi goals (#2),
- * Connected-Component $O(1)$ unreachable rejection (#D1), and Global Reverse-Dijkstra Swarm Fields (#B3).
+ * Hierarchical A*, Funnel String-Puller (#F5) & Swarm Broadcast Pathfinder (#B3) operating over `PortalGraph`.
  */
 export class MacroPathfinder {
   constructor(grid, graph, goalCacheCap = 256) {
@@ -1308,11 +1435,10 @@ export class MacroPathfinder {
     this.g = new Float64Array(N); this.parent = new Int32Array(N);
     this.parentChunk = new Int32Array(N); this.seen = new Uint32Array(N);
     this.closed = new Uint32Array(N); this.it = new ChunkIntegrator();
-    this.startField = new Float64Array(CC); this.heap = new MinHeap(256); this.stamp = 0;
+    this.startField = new Float32Array(CC); this.heap = new MinHeap(256); this.stamp = 0;
     this._swarmIdCounter = 1;
   }
 
-  /** #B1: Selectively invalidates only cached goals residing inside modified chunks */
   invalidateChunks(dirtyChunks) {
     for (const [cell, goal] of this.goalCache) {
       if (dirtyChunks.has(goal.chunk)) this.goalCache.delete(cell);
@@ -1321,32 +1447,37 @@ export class MacroPathfinder {
 
   createGoal(cell) {
     const { grid, graph } = this, x = cell % grid.width, y = cell / grid.width | 0;
-    const chunk = grid.chunkIdAt(x, y), field = new Float64Array(CC);
+    const chunk = grid.chunkIdAt(x, y), field = new Float32Array(CC);
     this.it.integrate(grid, chunk, [grid.localIndex(cell)], field, {
       minClearance: graph.minClearance,
       profile: graph.profile
     });
-    const portalCost = new Float64Array(graph.portals.length).fill(Infinity);
+    const portalCost = new Float32Array(graph.portals.length).fill(Infinity);
     const cPortals = graph.chunkPortals[chunk];
     const compSet = new Set();
+    let sccMaskLo = 0, sccMaskHi = 0;
     for (let i = 0; i < cPortals.length; i++) {
       const pid = cPortals[i], p = graph.portals[pid];
       const d = graph._samplePortalRowDist(field, p, chunk);
       if (d < Infinity) {
         portalCost[pid] = d;
         compSet.add(graph.portalComp[pid]);
+        const bit = graph.portalScc[pid] & 63;
+        if (bit < 32) sccMaskLo |= (1 << bit);
+        else sccMaskHi |= (1 << (bit - 32));
       }
     }
-    return { isMulti: false, cell, x, y, chunk, field, portalCost, compSet, graph };
+    return { isMulti: false, cell, x, y, chunk, field, portalCost, compSet, sccMaskLo, sccMaskHi, graph };
   }
 
   createMultiGoal(targets) {
     const { grid, graph } = this;
-    const portalCost = new Float64Array(graph.portals.length).fill(Infinity);
+    const portalCost = new Float32Array(graph.portals.length).fill(Infinity);
     const portalGoalCell = new Int32Array(graph.portals.length).fill(-1);
     const chunkGroups = new Map();
     const goalList = [];
     const compSet = new Set();
+    let sccMaskLo = 0, sccMaskHi = 0;
 
     for (let i = 0; i < targets.length; i++) {
       const t = targets[i];
@@ -1361,7 +1492,7 @@ export class MacroPathfinder {
 
     const chunkFields = new Map();
     for (const [chunk, sources] of chunkGroups) {
-      const field = new Float64Array(CC);
+      const field = new Float32Array(CC);
       const sourceOut = new Int32Array(CC);
       const seeded = sources.map(s => ({ cell: s.cell, weight: s.weight, id: s.globalCell }));
       this.it.integrate(grid, chunk, seeded, field, {
@@ -1378,6 +1509,9 @@ export class MacroPathfinder {
           portalCost[pid] = d;
           portalGoalCell[pid] = sourceOut[loc] >= 0 ? sourceOut[loc] : sources[0].globalCell;
           compSet.add(graph.portalComp[pid]);
+          const bit = graph.portalScc[pid] & 63;
+          if (bit < 32) sccMaskLo |= (1 << bit);
+          else sccMaskHi |= (1 << (bit - 32));
         }
       }
     }
@@ -1394,6 +1528,8 @@ export class MacroPathfinder {
       portalCost,
       portalGoalCell,
       compSet,
+      sccMaskLo,
+      sccMaskHi,
       graph
     };
   }
@@ -1407,6 +1543,76 @@ export class MacroPathfinder {
     }
     this.goalCache.set(cell, g);
     return g;
+  }
+
+  /**
+   * #F5: Runs the 2D Simple Stupid Funnel Algorithm (SSFA) across `portals` to compute
+   * per-chunk string-pulled visibility targets (`funnelX`, `funnelY`) for cross-chunk corner cutting.
+   */
+  _computePortalFunnel(portals, chunks, sx, sy, gx, gy) {
+    const P = portals.length, C = chunks.length;
+    const funnelX = new Float32Array(C), funnelY = new Float32Array(C);
+    funnelX[C - 1] = gx; funnelY[C - 1] = gy;
+    if (P === 0) return { funnelX, funnelY };
+
+    const gPortals = this.graph.portals;
+    const lx = new Float32Array(P + 1), ly = new Float32Array(P + 1);
+    const rx = new Float32Array(P + 1), ry = new Float32Array(P + 1);
+
+    for (let i = 0; i < P; i++) {
+      const p = gPortals[portals[i]], fromChunk = chunks[i];
+      const x0 = p.isH ? p.start : p.border, y0 = p.isH ? p.border : p.start;
+      const x1 = p.isH ? p.end + 1 : p.border, y1 = p.isH ? p.border : p.end + 1;
+      const pos = fromChunk === p.chunkA;
+      if (p.isH ? pos : !pos) {
+        lx[i] = x1; ly[i] = y1; rx[i] = x0; ry[i] = y0;
+      } else {
+        lx[i] = x0; ly[i] = y0; rx[i] = x1; ry[i] = y1;
+      }
+    }
+    lx[P] = rx[P] = gx; ly[P] = ry[P] = gy;
+
+    const triArea2 = (ax, ay, bx, by, cx, cy) => (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    let apexX = sx, apexY = sy, lIdx = 0, rIdx = 0;
+    let pLx = lx[0], pLy = ly[0], pRx = rx[0], pRy = ry[0];
+    let stepWrite = 0;
+
+    for (let i = 1; i <= P; i++) {
+      const nLx = lx[i], nLy = ly[i], nRx = rx[i], nRy = ry[i];
+      if (triArea2(apexX, apexY, pRx, pRy, nRx, nRy) <= 0) {
+        if ((apexX === pRx && apexY === pRy) || triArea2(apexX, apexY, pLx, pLy, nRx, nRy) > 0) {
+          pRx = nRx; pRy = nRy; rIdx = i;
+        } else {
+          while (stepWrite <= lIdx && stepWrite < P) {
+            funnelX[stepWrite] = pLx; funnelY[stepWrite] = pLy; stepWrite++;
+          }
+          apexX = pLx; apexY = pLy;
+          pRx = apexX; pRy = apexY; rIdx = lIdx;
+          i = lIdx;
+          continue;
+        }
+      }
+      if (triArea2(apexX, apexY, pLx, pLy, nLx, nLy) >= 0) {
+        if ((apexX === pLx && apexY === pLy) || triArea2(apexX, apexY, pRx, pRy, nLx, nLy) < 0) {
+          pLx = nLx; pLy = nLy; lIdx = i;
+        } else {
+          while (stepWrite <= rIdx && stepWrite < P) {
+            funnelX[stepWrite] = pRx; funnelY[stepWrite] = pRy; stepWrite++;
+          }
+          apexX = pRx; apexY = pRy;
+          pLx = apexX; pLy = apexY; lIdx = rIdx;
+          i = rIdx;
+          continue;
+        }
+      }
+    }
+    while (stepWrite < P) {
+      const p = gPortals[portals[stepWrite]];
+      funnelX[stepWrite] = clamp(gx, p.isH ? p.start + 0.5 : p.border, p.isH ? p.end + 0.5 : p.border);
+      funnelY[stepWrite] = clamp(gy, p.isH ? p.border : p.start + 0.5, p.isH ? p.border : p.end + 0.5);
+      stepWrite++;
+    }
+    return { funnelX, funnelY };
   }
 
   findPath(startCell, goalOrCell) {
@@ -1427,7 +1633,6 @@ export class MacroPathfinder {
       forward: true
     });
 
-    // Check direct intra-chunk reachability & #D1 component overlap
     let sameChunkDirect = false;
     if (!goal.isMulti && sc === goal.chunk && goal.field[grid.localIndex(startCell)] < Infinity) {
       sameChunkDirect = true;
@@ -1437,16 +1642,21 @@ export class MacroPathfinder {
 
     const cPorts = graph.chunkPortals[sc];
     if (!sameChunkDirect && goal.compSet) {
-      let compMatch = false;
+      let reachableMatch = false;
+      const gLo = goal.sccMaskLo, gHi = goal.sccMaskHi;
       for (let i = 0; i < cPorts.length; i++) {
         const pid = cPorts[i], p = graph.portals[pid];
-        if (this.startField[pLocal(grid, p, sc)] < Infinity && goal.compSet.has(graph.portalComp[pid])) {
-          compMatch = true;
-          break;
+        if (this.startField[pLocal(grid, p, sc)] < Infinity && crossingCost(grid, p, sc, graph.profile) < Infinity) {
+          if (!goal.compSet.has(graph.portalComp[pid])) continue;
+          const uScc = graph.portalScc[pid];
+          // #H2: O(1) Directed SCC DAG reachability bitmask check
+          if (((graph.sccReachLo[uScc] & gLo) !== 0) || ((graph.sccReachHi[uScc] & gHi) !== 0)) {
+            reachableMatch = true;
+            break;
+          }
         }
       }
-      // #D1: O(1) instant abort if start and goal share no connected component
-      if (!compMatch) return null;
+      if (!reachableMatch) return null;
     }
 
     const heuristic = (px, py) => {
@@ -1480,10 +1690,15 @@ export class MacroPathfinder {
         const portals = [], chunks = [parentChunk[GOAL]];
         let n = parent[GOAL];
         while (n !== START) { portals.push(n); chunks.push(parentChunk[n]); n = parent[n]; }
+        const pArr = new Int32Array(portals.reverse());
+        const cArr = new Int32Array(chunks.reverse());
         const fgx = (chosenGoalCell % grid.width) + 0.5, fgy = ((chosenGoalCell / grid.width) | 0) + 0.5;
+        const { funnelX, funnelY } = this._computePortalFunnel(pArr, cArr, sx + 0.5, sy + 0.5, fgx, fgy);
         return {
-          portals: new Int32Array(portals.reverse()),
-          chunks: new Int32Array(chunks.reverse()),
+          portals: pArr,
+          chunks: cArr,
+          funnelX,
+          funnelY,
           cost: g[GOAL],
           goalCell: chosenGoalCell,
           goalX: fgx,
@@ -1526,13 +1741,12 @@ export class MacroPathfinder {
 
   /**
    * #B3: Builds a Global Reverse-Dijkstra Swarm Broadcast Field over `PortalGraph` in O(E log P).
-   * Allows 10,000+ agents anywhere on the map to flow toward `targets` with zero per-agent `findPath` calls.
    */
   createSwarmField(targets) {
     const goal = Array.isArray(targets) ? this.createMultiGoal(targets) : this.getOrCreateGoal(targets);
     const { graph, heap } = this;
     const P = graph.portals.length;
-    const portalDist = new Float64Array(P).fill(Infinity);
+    const portalDist = new Float32Array(P).fill(Infinity);
     const portalNext = new Int32Array(P).fill(-1);
     heap.clear();
 
@@ -1540,12 +1754,11 @@ export class MacroPathfinder {
       const gc = goal.portalCost[p];
       if (gc < Infinity) {
         portalDist[p] = gc;
-        portalNext[p] = -2; // Direct to goal inside chunk
+        portalNext[p] = -2;
         heap.push(p, gc);
       }
     }
 
-    // Reverse Dijkstra across graph edges (from target `v` backward to source `u`)
     while (!heap.isEmpty) {
       const v = heap.pop(), dv = heap.lastKey;
       if (dv > portalDist[v]) continue;
@@ -1571,6 +1784,8 @@ export class MacroPathfinder {
       isSwarm: true,
       uid: this._swarmIdCounter++,
       goal,
+      goalX: goal.x + 0.5,
+      goalY: goal.y + 0.5,
       portalDist,
       portalNext,
       goalChunks,
@@ -1583,13 +1798,13 @@ export class MacroPathfinder {
 }
 //#endregion
 
-//#region 6: Flow Vector Extraction, Lookahead Seeding, Cache & Samplers (#A1, #A3, #B4, #D2)
+//#region 16: Chunk Line-of-Sight & Flow Vector Extraction (#3, #4, #7, #A1, #F2)
 /**
  * #3: Fast chunk-local supercover Line-of-Sight check.
  */
 export function hasChunkLOS(costs, x0, y0, x1, y1, refCost = COST_OPEN) {
-  let cx = x0 | 0, cy = y0 | 0;
-  const ex = x1 | 0, ey = y1 | 0;
+  let cx = clamp(x0 | 0, 0, CS - 1), cy = clamp(y0 | 0, 0, CS - 1);
+  const ex = clamp(x1 | 0, 0, CS - 1), ey = clamp(y1 | 0, 0, CS - 1);
   const dx = Math.abs(ex - cx), dy = Math.abs(ey - cy);
   const sx = cx < ex ? 1 : -1, sy = cy < ey ? 1 : -1;
   let err = dx - dy;
@@ -1616,21 +1831,27 @@ export function computeFlowVectors(f, exX, exY, opts = {}) {
   const txL = opts.targetLocalX, tyL = opts.targetLocalY, cCosts = opts.chunkCosts;
   const refCost = hasLOS ? cCosts[clamp(tyL | 0, 0, CS - 1) * CS + clamp(txL | 0, 0, CS - 1)] : COST_OPEN;
   const borderExitMask = opts.borderExitMask || null;
+  const borderExX = opts.borderExX || null;
+  const borderExY = opts.borderExY || null;
 
   for (let y = 0; y < CS; y++) {
     for (let x = 0; x < CS; x++) {
       const id = y * CS + x, cur = I[id];
       if (cur === Infinity) { FX[id] = FY[id] = 0; continue; }
-      if ((!cur || (borderExitMask && borderExitMask[id])) && !vortex && (exX || exY)) {
-        // #A1: For lookahead-seeded portal cells, blend exit normal with tangent gradient along portal
+
+      // #A1 & #F2: Per-cell exit normal lookup for portal and multi-portal swarm borders
+      const cellExX = borderExX && borderExitMask && borderExitMask[id] ? borderExX[id] : exX;
+      const cellExY = borderExY && borderExitMask && borderExitMask[id] ? borderExY[id] : exY;
+
+      if ((!cur || (borderExitMask && borderExitMask[id])) && !vortex && (cellExX || cellExY)) {
         const E = at(x + 1, y), W = at(x - 1, y), S = at(x, y + 1), N = at(x, y - 1);
-        const gx = exX !== 0 ? 0 : (E < W ? (E < cur ? E - cur : 0) : W < cur ? cur - W : 0);
-        const gy = exY !== 0 ? 0 : (S < N ? (S < cur ? S - cur : 0) : N < cur ? cur - N : 0);
-        const vx = exX - gx * 0.45, vy = exY - gy * 0.45, vl = Math.hypot(vx, vy) || 1;
+        const gx = cellExX !== 0 ? 0 : (E < W ? (E < cur ? E - cur : 0) : W < cur ? cur - W : 0);
+        const gy = cellExY !== 0 ? 0 : (S < N ? (S < cur ? S - cur : 0) : N < cur ? cur - N : 0);
+        const vx = cellExX - gx * 0.45, vy = cellExY - gy * 0.45, vl = Math.hypot(vx, vy) || 1;
         FX[id] = vx / vl; FY[id] = vy / vl;
         continue;
       }
-      if (!cur && !vortex) { FX[id] = exX; FY[id] = exY; continue; }
+      if (!cur && !vortex) { FX[id] = cellExX; FY[id] = cellExY; continue; }
 
       let dx = 0, dy = 0, ok = false;
 
@@ -1659,7 +1880,7 @@ export function computeFlowVectors(f, exX, exY, opts = {}) {
             if (sl > bS) { bS = sl; bx = DX[d]; by = DY[d]; }
           }
           const l2 = Math.hypot(bx, by);
-          dx = bx / l2 || exX; dy = by / l2 || exY;
+          dx = bx / l2 || cellExX; dy = by / l2 || cellExY;
         }
       }
 
@@ -1693,11 +1914,13 @@ export function computeFlowVectors(f, exX, exY, opts = {}) {
     }
   }
 }
+//#endregion
 
+//#region 17: Geodesic Guide-Curve & Spline Corridor Builder (#10, #D2, #F4)
 /**
- * #10 & #D2: Multi-Chunk Guide-Curve / Spline Corridor Flow Field builder.
- * Supports curves inside the chunk as well as curves in neighboring chunks by seeding
- * closest border entry cells with their cross-track distance and curve tangent.
+ * #10, #D2 & #F4: Multi-Chunk Geodesic Guide-Curve / Spline Corridor Flow Field builder.
+ * Propagates corridor distances through `PortalGraph` when the spline lies in neighboring chunks
+ * so agents route around walls to join the corridor rather than pushing into solid walls.
  */
 export function buildCorridorField(grid, chunkId, polyline, opts = {}) {
   const ox = grid.chunkOriginX(chunkId), oy = grid.chunkOriginY(chunkId);
@@ -1707,11 +1930,14 @@ export function buildCorridorField(grid, chunkId, polyline, opts = {}) {
     integration: pool ? pool.allocF32() : new Float32Array(CC),
     flowX: pool ? pool.allocF32() : new Float32Array(CC),
     flowY: pool ? pool.allocF32() : new Float32Array(CC),
-    sourceId: pool ? pool.allocI32() : new Int32Array(CC)
+    sourceId: pool ? pool.allocI32() : new Int32Array(CC),
+    _pooled: false
   };
   const spineTanX = new Float32Array(CC), spineTanY = new Float32Array(CC);
   const seedDist = new Float32Array(CC).fill(Infinity), sources = [];
   const minClearance = opts.minClearance ?? 1;
+  const graph = opts.graph || null;
+  let hasInChunk = false;
 
   for (let i = 0; i < polyline.length - 1; i++) {
     const p0 = polyline[i], p1 = polyline[i + 1];
@@ -1729,17 +1955,37 @@ export function buildCorridorField(grid, chunkId, polyline, opts = {}) {
         const cell = ly * CS + lx;
         spineTanX[cell] = tx; spineTanY[cell] = ty;
         if (seedDist[cell] > 0) seedDist[cell] = 0;
-      } else {
-        // #D2: Cross-chunk corridor projection onto chunk perimeter
-        const clx = clamp(lx, 0, CS - 1), cly = clamp(ly, 0, CS - 1);
-        if (grid.isWalkable(ox + clx, oy + cly, minClearance, opts.profile)) {
-          const cell = cly * CS + clx;
-          const d = Math.hypot(wx - (ox + clx + 0.5), wy - (oy + cly + 0.5)) * COST_OPEN;
-          if (d < seedDist[cell]) {
-            seedDist[cell] = d;
-            spineTanX[cell] = tx; spineTanY[cell] = ty;
+        hasInChunk = true;
+      }
+    }
+  }
+
+  // #F4: If spline is in another chunk, seed only open portals of `chunkId` via PortalGraph
+  if (!hasInChunk) {
+    const cPortals = graph ? graph.chunkPortals[chunkId] : null;
+    for (let i = 0; i < polyline.length - 1; i++) {
+      const p0 = polyline[i], p1 = polyline[i + 1];
+      const x0 = Array.isArray(p0) ? p0[0] : p0.x, y0 = Array.isArray(p0) ? p0[1] : p0.y;
+      const x1 = Array.isArray(p1) ? p1[0] : p1.x, y1 = Array.isArray(p1) ? p1[1] : p1.y;
+      const dx = x1 - x0, dy = y1 - y0, segLen = Math.hypot(dx, dy);
+      if (segLen < 1e-5) continue;
+      const tx = dx / segLen, ty = dy / segLen, mx = 0.5 * (x0 + x1), my = 0.5 * (y0 + y1);
+      if (cPortals && cPortals.length > 0) {
+        for (let k = 0; k < cPortals.length; k++) {
+          const p = graph.portals[cPortals[k]], cells = portalSideCells(p, chunkId);
+          const pd = octile(mx - p.anchorX, my - p.anchorY) * COST_OPEN;
+          for (let j = 0; j < cells.length; j++) {
+            const loc = grid.localIndex(cells[j]);
+            if (pd < seedDist[loc]) {
+              seedDist[loc] = pd;
+              spineTanX[loc] = tx; spineTanY[loc] = ty;
+            }
           }
         }
+      } else {
+        const clx = clamp(Math.floor(mx - ox), 0, CS - 1), cly = clamp(Math.floor(my - oy), 0, CS - 1);
+        const loc = cly * CS + clx, pd = octile(mx - (ox + clx + 0.5), my - (oy + cly + 0.5)) * COST_OPEN;
+        if (pd < seedDist[loc]) { seedDist[loc] = pd; spineTanX[loc] = tx; spineTanY[loc] = ty; }
       }
     }
   }
@@ -1770,10 +2016,11 @@ export function buildCorridorField(grid, chunkId, polyline, opts = {}) {
   }
   return f;
 }
+//#endregion
 
+//#region 18: LRU Flow Field Cache & Cross-Boundary Seeding (#A1, #B4, #F1, #F2, #F4, #F5)
 /**
- * #A1, #B4, #D2: LRU cache of per-chunk flow fields backed by `FieldBufferPool`.
- * Caches Portal (with lookahead), Goal, Swarm (#B3), Multi-Goal (#2), Vortex (#7), Flee (#8), and Corridor (#10) fields.
+ * #A1, #B4, #F1, #F2, #F4, #F5: Collision-proof LRU cache of per-chunk flow fields backed by `FieldBufferPool`.
  */
 export class FlowFieldCache {
   constructor(grid, cap = 2048) {
@@ -1783,14 +2030,31 @@ export class FlowFieldCache {
     this.it = new ChunkIntegrator();
     this.pool = new FieldBufferPool(Math.min(cap, 1024));
     this._borderMask = new Uint8Array(CC);
+    this._borderExX = new Float32Array(CC);
+    this._borderExY = new Float32Array(CC);
   }
 
-  key(c, kind, tid, minClearance = 1, extra = 0) {
+  /** #F1: Composite hash including profileId */
+  key(c, kind, tid, minClearance = 1, extra = 0, profile = null) {
+    const profId = this.grid.getProfileId(profile);
     let h = hashMix(2166136261, c);
     h = hashMix(h, kind.charCodeAt(0));
     h = hashMix(h, tid);
     h = hashMix(h, minClearance);
-    return hashMix(h, extra);
+    h = hashMix(h, extra);
+    return hashMix(h, profId);
+  }
+
+  /** #F1: Exact tag verification eliminating 32-bit hash collision aliasing */
+  _match(hit, c, kind, tid, minClearance, extra, profile) {
+    return !!(hit && hit.chunkId === c && hit.kind === kind && hit.tid === tid &&
+      hit.minClearance === minClearance && hit.extra === extra && hit.profile === profile);
+  }
+
+  _tag(f, c, kind, tid, minClearance, extra, profile) {
+    f.chunkId = c; f.kind = kind; f.tid = tid;
+    f.minClearance = minClearance; f.extra = extra; f.profile = profile;
+    return f;
   }
 
   _promote(k, hit) {
@@ -1828,13 +2092,12 @@ export class FlowFieldCache {
   }
 
   /**
-   * #A1: Builds or retrieves a portal flow field with optional Cross-Boundary Wavefront Seeding (`nextField`)
-   * so waves curve smoothly into the optimal crossing point before reaching the chunk seam.
+   * #A1 & #F5: Portal field with Cross-Boundary Wavefront Seeding and optional Funnel Target LOS.
    */
-  getPortalField(c, p, minClearance = 1, nextField = null, nextTid = 0, profile = null) {
-    const k = this.key(c, 'p', p.uid, minClearance, nextTid);
+  getPortalField(c, p, minClearance = 1, nextField = null, nextTid = 0, profile = null, funnelX = undefined, funnelY = undefined) {
+    const k = this.key(c, 'p', p.uid, minClearance, nextTid, profile);
     const hit = this.entries.get(k);
-    if (hit && hit.chunkId === c) return this._promote(k, hit);
+    if (this._match(hit, c, 'p', p.uid, minClearance, nextTid, profile)) return this._promote(k, hit);
 
     const sideA = portalSideCells(p, c);
     const nextChunk = c === p.chunkA ? p.chunkB : p.chunkA;
@@ -1862,34 +2125,47 @@ export class FlowFieldCache {
       sources[i] = { cell: loc, weight: w, id: i };
     }
 
-    return this.build(k, c, 'p', sources, portalExitX(p, c), portalExitY(p, c), {
+    const ox = grid.chunkOriginX(c), oy = grid.chunkOriginY(c);
+    const hasFunnelTarget = funnelX !== undefined && funnelY !== undefined;
+    const f = this.build(k, c, 'p', sources, portalExitX(p, c), portalExitY(p, c), {
       minClearance,
       profile,
-      borderExitMask: nextField && minNext < Infinity ? _borderMask : null
+      borderExitMask: nextField && minNext < Infinity ? _borderMask : null,
+      losSmoothing: hasFunnelTarget && grid.losSmoothing,
+      targetLocalX: hasFunnelTarget ? clamp(funnelX - ox, 0.5, CS - 0.5) : undefined,
+      targetLocalY: hasFunnelTarget ? clamp(funnelY - oy, 0.5, CS - 0.5) : undefined
     });
+    return this._tag(f, c, 'p', p.uid, minClearance, nextTid, profile);
   }
 
   getGoalField(c, cell, minClearance = 1, profile = null) {
-    const k = this.key(c, 'g', cell, minClearance);
+    const k = this.key(c, 'g', cell, minClearance, 0, profile);
     const hit = this.entries.get(k);
-    if (hit && hit.chunkId === c) return this._promote(k, hit);
+    if (this._match(hit, c, 'g', cell, minClearance, 0, profile)) return this._promote(k, hit);
     const loc = this.grid.localIndex(cell);
-    return this.build(k, c, 'g', [loc], 0, 0, {
+    const f = this.build(k, c, 'g', [loc], 0, 0, {
       minClearance,
       profile,
       losSmoothing: this.grid.losSmoothing,
       targetLocalX: (loc % CS) + 0.5,
       targetLocalY: ((loc / CS) | 0) + 0.5
     });
+    return this._tag(f, c, 'g', cell, minClearance, 0, profile);
   }
 
-  /** #B3: Builds and caches the unified per-chunk field for a Global Swarm Broadcast Field */
+  /**
+   * #B3 & #F2: Builds and caches the unified per-chunk field for a Global Swarm Broadcast Field.
+   * Assigns per-portal exit normals (`_borderExX`, `_borderExY`) so bisected chunks never bleed exit vectors,
+   * and seeds portal cells with downstream chunk integration values when cached (#A1).
+   */
   getSwarmChunkField(c, swarm) {
-    const k = this.key(c, 's', swarm.uid, swarm.minClearance, swarm.weightVersion);
+    const k = this.key(c, 's', swarm.uid, swarm.minClearance, swarm.weightVersion, swarm.profile);
     const hit = this.entries.get(k);
-    if (hit && hit.chunkId === c) return this._promote(k, hit);
+    if (this._match(hit, c, 's', swarm.uid, swarm.minClearance, swarm.weightVersion, swarm.profile)) {
+      return this._promote(k, hit);
+    }
 
-    const { grid, _borderMask } = this;
+    const { grid, _borderMask, _borderExX, _borderExY } = this;
     const { graph, portalDist, goalChunks } = swarm;
     const cPortals = graph.chunkPortals[c];
     const inChunkGoals = goalChunks.get(c);
@@ -1903,7 +2179,7 @@ export class FlowFieldCache {
     if (minW === Infinity) return null;
 
     const sources = [];
-    let domExX = 0, domExY = 0, bestP = -1, bestPD = Infinity;
+    let domExX = 0, domExY = 0, bestPD = Infinity;
 
     if (inChunkGoals) {
       for (let i = 0; i < inChunkGoals.length; i++) {
@@ -1916,53 +2192,78 @@ export class FlowFieldCache {
       const pid = cPortals[i], pd = portalDist[pid];
       if (pd === Infinity) continue;
       const p = graph.portals[pid], cells = portalSideCells(p, c);
+      const nextChunk = c === p.chunkA ? p.chunkB : p.chunkA;
+      const nextCells = portalSideCells(p, nextChunk);
+      const exX = portalExitX(p, c), exY = portalExitY(p, c);
       const relW = pd - minW;
-      if (pd < bestPD) {
-        bestPD = pd; bestP = p;
-        domExX = portalExitX(p, c); domExY = portalExitY(p, c);
+      if (pd < bestPD) { bestPD = pd; domExX = exX; domExY = exY; }
+
+      // #F2: Check if downstream neighbor chunk is already cached for cross-boundary cell-by-cell lookahead
+      const nk = this.key(nextChunk, 's', swarm.uid, swarm.minClearance, swarm.weightVersion, swarm.profile);
+      const nField = this.entries.get(nk);
+      let nMin = Infinity;
+      if (nField && nField.chunkId === nextChunk) {
+        for (let j = 0; j < nextCells.length; j++) {
+          const nd = nField.integration[grid.localIndex(nextCells[j])];
+          if (nd < nMin) nMin = nd;
+        }
       }
+
       for (let j = 0; j < cells.length; j++) {
         const loc = grid.localIndex(cells[j]);
         _borderMask[loc] = 1;
-        sources.push({ cell: loc, weight: relW, id: pid });
+        _borderExX[loc] = exX;
+        _borderExY[loc] = exY;
+        let cellOffset = 0;
+        if (nField && nMin < Infinity) {
+          const nd = nField.integration[grid.localIndex(nextCells[j])];
+          if (nd < Infinity) cellOffset = (nd - nMin) * 0.5;
+        }
+        sources.push({ cell: loc, weight: relW + cellOffset, id: pid });
       }
     }
 
     const singleGoalLoc = inChunkGoals && inChunkGoals.length === 1 && bestPD > 0 ? inChunkGoals[0].cell : -1;
-    return this.build(k, c, 's', sources, inChunkGoals ? 0 : domExX, inChunkGoals ? 0 : domExY, {
+    const f = this.build(k, c, 's', sources, inChunkGoals ? 0 : domExX, inChunkGoals ? 0 : domExY, {
       minClearance: swarm.minClearance,
       profile: swarm.profile,
-      borderExitMask: !inChunkGoals && bestP ? _borderMask : null,
+      borderExitMask: !inChunkGoals ? _borderMask : null,
+      borderExX: !inChunkGoals ? _borderExX : null,
+      borderExY: !inChunkGoals ? _borderExY : null,
       losSmoothing: singleGoalLoc >= 0 && grid.losSmoothing,
       targetLocalX: singleGoalLoc >= 0 ? (singleGoalLoc % CS) + 0.5 : undefined,
       targetLocalY: singleGoalLoc >= 0 ? ((singleGoalLoc / CS) | 0) + 0.5 : undefined
     });
+    return this._tag(f, c, 's', swarm.uid, swarm.minClearance, swarm.weightVersion, swarm.profile);
   }
 
-  /** #B4: Cached Multi-Goal Voronoi field */
   getMultiGoalField(c, sources, minClearance = 1, profile = null) {
     let h = sources.length;
     for (let i = 0; i < sources.length; i++) {
       const s = sources[i];
       h = hashMix(h, typeof s === 'object' ? s.cell : s);
     }
-    const k = this.key(c, 'm', h, minClearance);
+    const k = this.key(c, 'm', h, minClearance, 0, profile);
     const hit = this.entries.get(k);
-    if (hit && hit.chunkId === c) return this._promote(k, hit);
+    if (this._match(hit, c, 'm', h, minClearance, 0, profile)) return this._promote(k, hit);
 
     const f = this._allocField(c, 'm', true);
     this.it.integrate(this.grid, c, sources, f.integration, { minClearance, profile, sourceOut: f.sourceId });
     computeFlowVectors(f, 0, 0, { grid: this.grid });
+    this._tag(f, c, 'm', h, minClearance, 0, profile);
     return this._store(k, f);
   }
 
-  /** #7, #B4 & #D2: Cached Vortex / Orbit field supporting both intra-chunk and cross-chunk vortex centers */
+  /**
+   * #7, #B4 & #F4: Cached Vortex / Orbit field using `PortalGraph` geodesic seeding for cross-chunk centers.
+   */
   getVortexField(c, centerCell, vortexOpts = {}) {
     const minClearance = vortexOpts.minClearance ?? 1;
-    const rKey = ((vortexOpts.radius ?? 4) * 100) | 0;
-    const k = this.key(c, 'v', centerCell, minClearance, rKey ^ (vortexOpts.clockwise === false ? 1 : 0));
+    const profile = vortexOpts.profile ?? null;
+    const extra = (((vortexOpts.radius ?? 4) * 100) | 0) ^ (vortexOpts.clockwise === false ? 1 : 0);
+    const k = this.key(c, 'v', centerCell, minClearance, extra, profile);
     const hit = this.entries.get(k);
-    if (hit && hit.chunkId === c) return this._promote(k, hit);
+    if (this._match(hit, c, 'v', centerCell, minClearance, extra, profile)) return this._promote(k, hit);
 
     const { grid } = this;
     const f = this._allocField(c, 'v', false);
@@ -1971,7 +2272,7 @@ export class FlowFieldCache {
 
     if (centerChunk === c) {
       const loc = grid.localIndex(centerCell);
-      this.it.integrate(grid, c, [loc], f.integration, { minClearance, profile: vortexOpts.profile });
+      this.it.integrate(grid, c, [loc], f.integration, { minClearance, profile });
       computeFlowVectors(f, 0, 0, {
         grid,
         vortex: vortexOpts,
@@ -1981,32 +2282,55 @@ export class FlowFieldCache {
         targetLocalY: ((loc / CS) | 0) + 0.5
       });
     } else {
-      // #D2: Multi-chunk vortex: seed walkable chunk perimeter cells with geodesic octile distance to vortex center
-      const ox = f.originX, oy = f.originY;
+      // #F4: Seed only open portals of chunk `c` via PortalGraph or macro distances
+      const graph = vortexOpts.graph || null;
+      const macro = vortexOpts.macro || null;
       const vcx = (centerCell % grid.width) + 0.5, vcy = ((centerCell / grid.width) | 0) + 0.5;
       const seeds = [];
-      for (let t = 0; t < CS; t++) {
-        const perim = [t, (CS - 1) * CS + t, t * CS, t * CS + (CS - 1)];
-        for (let b = 0; b < 4; b++) {
-          const loc = perim[b], lx = loc % CS, ly = (loc / CS) | 0;
-          if (grid.isWalkable(ox + lx, oy + ly, minClearance, vortexOpts.profile)) {
-            const d = octile((ox + lx + 0.5) - vcx, (oy + ly + 0.5) - vcy) * COST_OPEN;
-            seeds.push({ cell: loc, weight: d, id: loc });
+      if (graph && graph.chunkPortals[c].length > 0) {
+        const goal = macro ? macro.getOrCreateGoal(centerCell) : null;
+        const cPortals = graph.chunkPortals[c];
+        for (let i = 0; i < cPortals.length; i++) {
+          const pid = cPortals[i], p = graph.portals[pid], cells = portalSideCells(p, c);
+          const baseD = (goal && goal.portalCost[pid] < Infinity)
+            ? goal.portalCost[pid]
+            : octile(p.anchorX - vcx, p.anchorY - vcy) * COST_OPEN;
+          for (let j = 0; j < cells.length; j++) {
+            seeds.push({ cell: grid.localIndex(cells[j]), weight: baseD, id: pid });
+          }
+        }
+      } else {
+        const ox = f.originX, oy = f.originY;
+        for (let t = 0; t < CS; t++) {
+          const perim = [t, (CS - 1) * CS + t, t * CS, t * CS + (CS - 1)];
+          for (let b = 0; b < 4; b++) {
+            const loc = perim[b], lx = loc % CS, ly = (loc / CS) | 0;
+            if (grid.isWalkable(ox + lx, oy + ly, minClearance, profile)) {
+              const d = octile((ox + lx + 0.5) - vcx, (oy + ly + 0.5) - vcy) * COST_OPEN;
+              seeds.push({ cell: loc, weight: d, id: loc });
+            }
           }
         }
       }
-      this.it.integrate(grid, c, seeds, f.integration, { minClearance, profile: vortexOpts.profile });
+      this.it.integrate(grid, c, seeds, f.integration, { minClearance, profile });
       computeFlowVectors(f, 0, 0, { grid, vortex: vortexOpts });
     }
+    this._tag(f, c, 'v', centerCell, minClearance, extra, profile);
     return this._store(k, f);
   }
 
-  /** #8, #B4 & #D2: Cached 2-Pass Flee field supporting threats inside or outside the chunk */
+  /**
+   * #8, #B4 & #F4: Cached 2-Pass Flee field routing out-of-chunk threats through open `PortalGraph` doorways
+   * instead of bleeding straight through solid walls.
+   */
   getFleeField(c, threatPointsOrCells, opts = {}) {
     const minClearance = opts.minClearance ?? 1;
+    const profile = opts.profile ?? null;
+    const graph = opts.graph || null;
     const { grid } = this, ox = grid.chunkOriginX(c), oy = grid.chunkOriginY(c);
     let h = threatPointsOrCells.length;
     const seeds = [];
+    const cPortals = graph ? graph.chunkPortals[c] : null;
 
     for (let i = 0; i < threatPointsOrCells.length; i++) {
       const t = threatPointsOrCells[i];
@@ -2019,8 +2343,20 @@ export class FlowFieldCache {
         const lx = (tx | 0) - ox, ly = (ty | 0) - oy;
         if (lx >>> 0 < CS && ly >>> 0 < CS) {
           seeds.push({ cell: ly * CS + lx, weight: 0, id: i });
+        } else if (cPortals && cPortals.length > 0) {
+          // #F4: Route external threat through chunk `c`'s open portals (doorways)
+          const tChunk = grid.chunkIdAt(clamp(tx | 0, 0, grid.width - 1), clamp(ty | 0, 0, grid.height - 1));
+          const tPorts = graph.chunkPortals[tChunk];
+          for (let pIdx = 0; pIdx < cPortals.length; pIdx++) {
+            const pid = cPortals[pIdx], p = graph.portals[pid];
+            if (tPorts && tPorts.length > 0 && graph.portalComp[pid] !== graph.portalComp[tPorts[0]]) continue;
+            const d = octile(tx - p.anchorX, ty - p.anchorY) * COST_OPEN;
+            const cells = portalSideCells(p, c);
+            for (let j = 0; j < cells.length; j++) {
+              seeds.push({ cell: grid.localIndex(cells[j]), weight: d, id: i });
+            }
+          }
         } else {
-          // #D2: Threat in outside chunk — project true incoming distance onto chunk perimeter
           const clx = clamp(lx, 0, CS - 1), cly = clamp(ly, 0, CS - 1);
           const d = octile(tx - (ox + clx + 0.5), ty - (oy + cly + 0.5)) * COST_OPEN;
           seeds.push({ cell: cly * CS + clx, weight: d, id: i });
@@ -2028,30 +2364,33 @@ export class FlowFieldCache {
       }
     }
 
-    const k = this.key(c, 'f', h, minClearance);
+    const k = this.key(c, 'f', h, minClearance, 0, profile);
     const hit = this.entries.get(k);
-    if (hit && hit.chunkId === c) return this._promote(k, hit);
+    if (this._match(hit, c, 'f', h, minClearance, 0, profile)) return this._promote(k, hit);
 
     const f = this._allocField(c, 'f', false);
     this.it.integrateFlee(grid, c, seeds, f.integration, opts);
     computeFlowVectors(f, 0, 0, { grid });
+    this._tag(f, c, 'f', h, minClearance, 0, profile);
     return this._store(k, f);
   }
 
-  /** #10, #B4 & #D2: Cached Multi-Chunk Guide-Curve Corridor field */
   getCorridorField(c, polyline, opts = {}) {
     const minClearance = opts.minClearance ?? 1;
+    const profile = opts.profile ?? null;
+    const extra = ((opts.radius ?? 2.5) * 100) | 0;
     let h = polyline.length;
     for (let i = 0; i < polyline.length; i++) {
       const p = polyline[i];
       const x = Array.isArray(p) ? p[0] : p.x, y = Array.isArray(p) ? p[1] : p.y;
       h = hashMix(hashMix(h, x * 10), y * 10);
     }
-    const k = this.key(c, 'c', h, minClearance, ((opts.radius ?? 2.5) * 100) | 0);
+    const k = this.key(c, 'c', h, minClearance, extra, profile);
     const hit = this.entries.get(k);
-    if (hit && hit.chunkId === c) return this._promote(k, hit);
+    if (this._match(hit, c, 'c', h, minClearance, extra, profile)) return this._promote(k, hit);
 
     const f = buildCorridorField(this.grid, c, polyline, { ...opts, pool: this.pool, integrator: this.it });
+    this._tag(f, c, 'c', h, minClearance, extra, profile);
     return this._store(k, f);
   }
 
@@ -2084,15 +2423,18 @@ export class FlowFieldCache {
       chunkCosts: this.it.costs,
       targetLocalX: opts.targetLocalX,
       targetLocalY: opts.targetLocalY,
-      borderExitMask: opts.borderExitMask
+      borderExitMask: opts.borderExitMask,
+      borderExX: opts.borderExX,
+      borderExY: opts.borderExY
     });
     return this._store(k, f);
   }
 }
+//#endregion
 
+//#region 19: Bilinear Flow Vector Sampler (#A3)
 /**
  * #A3: Bilinearly interpolates the flow direction vector `(out.x, out.y)` at world position `(px, py)`.
- * Supports seamless cross-chunk boundary blending when `neighborResolver(wx, wy)` is supplied.
  */
 export function sampleFlowBilinear(f, px, py, out = { x: 0, y: 0 }, neighborResolver = null) {
   const lx = px - f.originX - 0.5, ly = py - f.originY - 0.5;
@@ -2108,7 +2450,6 @@ export function sampleFlowBilinear(f, px, py, out = { x: 0, y: 0 }, neighborReso
       const id = cy * CS + cx;
       if (I[id] < Infinity) { sx += FX[id] * w; sy += FY[id] * w; ws += w; }
     } else if (neighborResolver) {
-      // #A3: Sample adjacent chunk cell across seam
       const wx = f.originX + cx, wy = f.originY + cy;
       const nf = neighborResolver(wx, wy);
       if (nf) {
@@ -2143,11 +2484,20 @@ export function sampleFlowBilinear(f, px, py, out = { x: 0, y: 0 }, neighborReso
 }
 //#endregion
 
-//#region 7: Built-in SoA Crowd Simulator & Spatial Hash Steering (#C2)
+//#region 20: SoA Crowd Steering Simulator, RVO-Lite & Settling (#C2, #G1, #G2, #G4)
+/** Agent state constants for `CrowdSystem` (#G2) */
+export const AGENT_STATE = Object.freeze({
+  IDLE: 0,
+  MOVING: 1,
+  ARRIVING: 2,
+  SETTLED: 3
+});
+
 /**
- * #C2: High-performance Structure-of-Arrays (SoA) Crowd Steering & Spatial Hash Simulator.
- * Handles 10,000+ agents with O(N) spatial hash neighbor separation, Wall SDF sliding,
- * automatic hintIdx progression, Swarm/Macro path following, and Velocity-Flux Congestion stamping (#C1).
+ * #C2, #G1, #G2, #G4: Structure-of-Arrays (SoA) Crowd Steering Simulator featuring:
+ * - #G1: Predictive RVO-Lite (Time-to-Collision $\tau$ horizon avoidance) + Continuous Wall-SDF Repulsion
+ * - #G2: Contagious Goal-Arrival Settling (stops destination mosh-pitting) & Stuck-Agent Auto-Repathing
+ * - #G4: Automatic portal crossing traffic recording for Wardrop load-balancing
  */
 export class CrowdSystem {
   constructor(pathfinder, capacity = 4096, opts = {}) {
@@ -2163,10 +2513,21 @@ export class CrowdSystem {
     this.speed = new Float32Array(capacity);
     this.hintIdx = new Int32Array(capacity);
     this.active = new Uint8Array(capacity);
+    this.state = new Uint8Array(capacity);
+    this.stuckTimer = new Float32Array(capacity);
+    this.anchorX = new Float32Array(capacity);
+    this.anchorY = new Float32Array(capacity);
     this.targets = new Array(capacity).fill(null);
 
     this.separationWeight = opts.separationWeight ?? 1.35;
+    this.rvoWeight = opts.rvoWeight ?? 0.85;
+    this.rvoHorizon = opts.rvoHorizon ?? 0.65;
+    this.wallSlideWeight = opts.wallSlideWeight ?? 1.1;
     this.steeringSmooth = opts.steeringSmooth ?? 0.25;
+    this.arrivalRadius = opts.arrivalRadius ?? 0.85;
+    this.settleClusterRadius = opts.settleClusterRadius ?? 6.0;
+    this.stuckTimeout = opts.stuckTimeout ?? 1.25;
+    this.autoRepath = opts.autoRepath ?? true;
     this.autoStampCongestion = opts.autoStampCongestion ?? false;
     this.congestionUnitWeight = opts.congestionUnitWeight ?? 0.5;
 
@@ -2187,6 +2548,10 @@ export class CrowdSystem {
     this.speed = copy(Float32Array, this.speed);
     this.hintIdx = copy(Int32Array, this.hintIdx);
     this.active = copy(Uint8Array, this.active);
+    this.state = copy(Uint8Array, this.state);
+    this.stuckTimer = copy(Float32Array, this.stuckTimer);
+    this.anchorX = copy(Float32Array, this.anchorX);
+    this.anchorY = copy(Float32Array, this.anchorY);
     this.agentNext = new Int32Array(nCap);
     this.targets.length = nCap;
     this.cap = nCap;
@@ -2195,10 +2560,13 @@ export class CrowdSystem {
   addAgent(x, y, { speed = 3.0, radius = 0.35, path = null } = {}) {
     if (this.count >= this.cap) this._grow();
     const id = this.count++;
-    this.px[id] = x; this.py[id] = y;
+    this.px[id] = this.anchorX[id] = x;
+    this.py[id] = this.anchorY[id] = y;
     this.vx[id] = 0; this.vy[id] = 0;
     this.speed[id] = speed; this.radius[id] = radius;
     this.hintIdx[id] = 0; this.active[id] = 1;
+    this.state[id] = path ? AGENT_STATE.MOVING : AGENT_STATE.IDLE;
+    this.stuckTimer[id] = 0;
     this.targets[id] = path;
     return id;
   }
@@ -2206,20 +2574,25 @@ export class CrowdSystem {
   setAgentTarget(id, pathOrSwarm) {
     this.targets[id] = pathOrSwarm;
     this.hintIdx[id] = 0;
+    this.state[id] = pathOrSwarm ? AGENT_STATE.MOVING : AGENT_STATE.IDLE;
+    this.stuckTimer[id] = 0;
+    this.anchorX[id] = this.px[id];
+    this.anchorY[id] = this.py[id];
   }
 
   removeAgent(id) {
     if (id >= 0 && id < this.count) {
       this.active[id] = 0;
+      this.state[id] = AGENT_STATE.IDLE;
       this.targets[id] = null;
     }
   }
 
-  /**
-   * Advances all active agents by `dt` seconds using spatial-hash separation and flow sampling.
-   */
-   step(dt = 1 / 60) {
-    const { pf, count, px, py, vx, vy, radius, speed, hintIdx, active, targets, cellHead, agentNext, _vec } = this;
+  step(dt = 1 / 60) {
+    const {
+      pf, count, px, py, vx, vy, radius, speed, hintIdx, active, state,
+      stuckTimer, anchorX, anchorY, targets, cellHead, agentNext, _vec
+    } = this;
     const { grid } = pf, W = grid.width, H = grid.height;
 
     // 1. Rebuild O(N) spatial hash & optionally stamp directional velocity flux (#C1)
@@ -2246,31 +2619,75 @@ export class CrowdSystem {
       }
     }
 
-    // 2. Steer, separate & slide agents
-    const sepW = this.separationWeight, smooth = this.steeringSmooth;
+    const sepW = this.separationWeight, rvoW = this.rvoWeight, tauMax = this.rvoHorizon;
+    const wallW = this.wallSlideWeight, smooth = this.steeringSmooth;
+    const arrR2 = this.arrivalRadius * this.arrivalRadius;
+    const settleR2 = this.settleClusterRadius * this.settleClusterRadius;
+    const hasSDF = !!grid.wallDist;
+
     for (let i = 0; i < count; i++) {
       if (!active[i]) continue;
       const x = px[i], y = py[i], r = radius[i], spd = speed[i];
-      let fx = 0, fy = 0;
-
       const t = targets[i];
-      if (t) {
+
+      if (!t || state[i] === AGENT_STATE.SETTLED || state[i] === AGENT_STATE.IDLE) {
+        vx[i] *= 0.6; vy[i] *= 0.6;
+        if (Math.hypot(vx[i], vy[i]) < 1e-3) { vx[i] = vy[i] = 0; continue; }
+      }
+
+      let fx = 0, fy = 0;
+      let gx = -1, gy = -1, distToGoal2 = Infinity;
+
+      if (t && state[i] !== AGENT_STATE.SETTLED) {
+        gx = t.goalX ?? -1; gy = t.goalY ?? -1;
+        if (gx >= 0) {
+          distToGoal2 = (gx - x) * (gx - x) + (gy - y) * (gy - y);
+          // #G2: Direct arrival within arrivalRadius
+          if (distToGoal2 <= arrR2) {
+            state[i] = AGENT_STATE.SETTLED;
+            vx[i] = vy[i] = 0;
+            continue;
+          }
+          state[i] = distToGoal2 <= settleR2 ? AGENT_STATE.ARRIVING : AGENT_STATE.MOVING;
+        }
+
         if (t.isSwarm) {
           if (pf.sampleSwarmFlow(t, x, y, _vec)) { fx = _vec.x; fy = _vec.y; }
         } else {
-          const res = pf.getFieldForPath(t, x, y, hintIdx[i]);
+          const prevHint = hintIdx[i];
+          const res = pf.getFieldForPath(t, x, y, prevHint);
           if (res) {
+            // #G4: Record portal crossing traffic when agent advances along path
+            if (res.chunkIndex > prevHint && prevHint < t.portals.length && t.graph) {
+              t.graph.addPortalTraffic(t.portals[prevHint], 1.0);
+            }
             hintIdx[i] = res.chunkIndex;
             if (sampleFlowBilinear(res.field, x, y, _vec)) { fx = _vec.x; fy = _vec.y; }
           }
         }
+
+        // #G2: Stuck-agent detection & automatic re-pathing around dynamic obstacles
+        if (this.autoRepath && !t.isSwarm && state[i] === AGENT_STATE.MOVING) {
+          if ((x - anchorX[i]) ** 2 + (y - anchorY[i]) ** 2 > 0.25) {
+            anchorX[i] = x; anchorY[i] = y; stuckTimer[i] = 0;
+          } else {
+            stuckTimer[i] += dt;
+            if (stuckTimer[i] >= this.stuckTimeout && gx >= 0) {
+              stuckTimer[i] = 0;
+              const newPath = pf.findPath(x, y, gx, gy, { minClearance: t.minClearance, profile: t.profile });
+              if (newPath) { targets[i] = newPath; hintIdx[i] = 0; }
+            }
+          }
+        }
       }
 
-      // Short-range spatial hash separation (3x3 neighborhood)
-      let sepX = 0, sepY = 0;
+      // 2. Spatial-hash separation + #G1 Predictive RVO-Lite + #G2 Contagious Arrival Settling
+      let sepX = 0, sepY = 0, rvoX = 0, rvoY = 0;
       const cx = clamp(x | 0, 0, W - 1), cy = clamp(y | 0, 0, H - 1);
       const yMin = Math.max(0, cy - 1), yMax = Math.min(H - 1, cy + 1);
       const xMin = Math.max(0, cx - 1), xMax = Math.min(W - 1, cx + 1);
+      const vxi = vx[i], vyi = vy[i];
+      let settledByNeighbor = false;
 
       for (let ny = yMin; ny <= yMax; ny++) {
         const row = ny * W;
@@ -2280,26 +2697,74 @@ export class CrowdSystem {
             const dx = x - px[j], dy = y - py[j];
             const minSep = r + radius[j];
             const d2 = dx * dx + dy * dy;
-            if (d2 > 0 && d2 < minSep * minSep) {
+            if (d2 <= 0) continue;
+
+            // Overlap separation
+            if (d2 < minSep * minSep) {
               const d = Math.sqrt(d2), push = (minSep - d) / d;
               sepX += dx * push; sepY += dy * push;
+
+              // #G2: Contagious settling when bumping into an already settled agent near the same goal
+              if (state[i] === AGENT_STATE.ARRIVING && state[j] === AGENT_STATE.SETTLED) {
+                const tj = targets[j];
+                if (tj && tj.goalX === gx && tj.goalY === gy) {
+                  settledByNeighbor = true;
+                }
+              }
+            } else if (rvoW > 0 && tauMax > 0 && d2 < 9.0) {
+              // #G1: Predictive RVO-Lite time-to-closest-approach avoidance
+              const dvx = vxi - vx[j], dvy = vyi - vy[j];
+              const dv2 = dvx * dvx + dvy * dvy;
+              if (dv2 > 1e-4) {
+                const dpDotDv = dx * dvx + dy * dvy;
+                if (dpDotDv < 0) {
+                  const tc = clamp(-dpDotDv / dv2, 0, tauMax);
+                  const fxD = dx + dvx * tc, fyD = dy + dvy * tc;
+                  const fd2 = fxD * fxD + fyD * fyD;
+                  const safeR = minSep + 0.15;
+                  if (fd2 < safeR * safeR && fd2 > 1e-6) {
+                    const fd = Math.sqrt(fd2);
+                    const w = ((safeR - fd) / fd) * (1 - tc / tauMax);
+                    rvoX += fxD * w; rvoY += fyD * w;
+                  }
+                }
+              }
             }
           }
         }
       }
 
-      let desX = fx + sepX * sepW, desY = fy + sepY * sepW;
+      if (settledByNeighbor) {
+        state[i] = AGENT_STATE.SETTLED;
+        vx[i] = vy[i] = 0;
+        continue;
+      }
+
+      // #G1: Continuous Wall-SDF boundary repulsion
+      let wallX = 0, wallY = 0;
+      if (hasSDF && wallW > 0) {
+        const gIdx = cy * W + cx, wd = grid.wallDist[gIdx], minWallD = r + 0.45;
+        if (wd > 0 && wd < minWallD) {
+          const push = (1 - wd / minWallD) * wallW;
+          wallX = grid.wallGradX[gIdx] * push;
+          wallY = grid.wallGradY[gIdx] * push;
+        }
+      }
+
+      let desX = fx + sepX * sepW + rvoX * rvoW + wallX;
+      let desY = fy + sepY * sepW + rvoY * rvoW + wallY;
       const dl = Math.hypot(desX, desY);
       if (dl > 1) { desX /= dl; desY /= dl; }
 
-      const nvx = vx[i] + (desX * spd - vx[i]) * smooth;
-      const nvy = vy[i] + (desY * spd - vy[i]) * smooth;
+      // Arrival braking ramp
+      const brake = state[i] === AGENT_STATE.ARRIVING ? clamp(Math.sqrt(distToGoal2) / this.settleClusterRadius, 0.35, 1.0) : 1.0;
+      const nvx = vxi + (desX * spd * brake - vxi) * smooth;
+      const nvy = vyi + (desY * spd * brake - vyi) * smooth;
       vx[i] = nvx; vy[i] = nvy;
 
       let nx = clamp(x + nvx * dt, 0.01, W - 0.01);
       let ny = clamp(y + nvy * dt, 0.01, H - 0.01);
 
-      // Axis-separated wall collision sliding
       if (!grid.isWalkable(nx | 0, ny | 0)) {
         if (grid.isWalkable(nx | 0, y | 0)) { ny = y; vy[i] = 0; }
         else if (grid.isWalkable(x | 0, ny | 0)) { nx = x; vx[i] = 0; }
@@ -2311,348 +2776,135 @@ export class CrowdSystem {
 }
 //#endregion
 
-//#region 8: Unified FlowFieldPathfinder API
+//#region 21: Hierarchical Squad & Formation Controller (#G3)
 /**
- * Unified Hierarchical Flow Field Pathfinding API (v2.0) exposing all flow field types,
- * Two-Tier Incremental Rebuilds (#B1), Swarm Broadcast Fields (#B3), Cross-Boundary Lookahead (#A1),
- * Seam-Aware Sampling (#A3), Squad Formation Sampling (#C4), Terrain Profiles (#D4), and Raycast/FOV (#E1).
+ * #G3: Hierarchical Squad & Formation Controller (`SquadSystem`).
+ * Manages virtual squad leaders, rubber-banded leader speed throttling when squad members lag in bottlenecks,
+ * and formation slot presets (`'line'`, `'column'`, `'wedge'`, `'box'`, `'circle'`).
  */
-export class FlowFieldPathfinder {
-  constructor(opts = {}) {
-    const cx = opts.width ? Math.ceil(opts.width / CS) : (opts.chunksX ?? 10);
-    const cy = opts.height ? Math.ceil(opts.height / CS) : (opts.chunksY ?? 10);
-    this.cacheCap = opts.cacheCap ?? 2048;
-    this.minClearance = opts.minClearance ?? 1;
-    this.portalLookahead = opts.portalLookahead ?? true;
-    this.seamInterpolation = opts.seamInterpolation ?? true;
-
-    this.grid = new GridWorld(cx, cy, opts.costs || null);
-    if (opts.useEikonal !== undefined) this.grid.useEikonal = opts.useEikonal;
-    if (opts.losSmoothing !== undefined) this.grid.losSmoothing = opts.losSmoothing;
-    if (opts.wallRepulsion) this.grid.enableWallRepulsion(opts.wallRepulsion);
-
-    this.graph = new PortalGraph(this.grid, null, null, this.minClearance, null);
-    this.macro = new MacroPathfinder(this.grid, this.graph);
-    this.cache = new FlowFieldCache(this.grid, this.cacheCap);
-    this.clearanceGraphs = new Map([[this._hierarchyKey(this.minClearance, null), { graph: this.graph, macro: this.macro }]]);
-    this._tmpVec = { x: 0, y: 0 };
+export class SquadSystem {
+  constructor(pathfinder, crowd = null) {
+    this.pf = pathfinder;
+    this.crowd = crowd || pathfinder.createCrowd();
+    this.squads = new Map();
+    this._nextSquadId = 1;
+    this._vec = { x: 0, y: 0 };
   }
 
-  get width() { return this.grid.width; }
-  get height() { return this.grid.height; }
-
-  _hierarchyKey(minClearance, profile) {
-    return profile ? `${minClearance}:${profile}` : minClearance;
-  }
-
-  getCost(x, y) { return this.grid.getCost(x, y); }
-  setCost(x, y, cost) { return this.grid.setCost(x, y, cost); }
-  setRect(x, y, w, h, cost) { return this.grid.setRect(x, y, w, h, cost); }
-  setDisc(x, y, r, cost) { return this.grid.setDisc(x, y, r, cost); }
-  loadCosts(costs) { this.grid.loadCosts(costs); }
-
-  // #D4: Terrain & Profile API delegates
-  registerProfile(name, costMapOrArray) { return this.grid.registerProfile(name, costMapOrArray); }
-  setTerrain(x, y, terrainId) { return this.grid.setTerrain(x, y, terrainId); }
-  setRectTerrain(x, y, w, h, terrainId) { return this.grid.setRectTerrain(x, y, w, h, terrainId); }
-
-  // #C3: Dynamic Moving Obstacle API delegates
-  stampDynamicObstacle(wx, wy, r, blocked = 1) { this.grid.stampDynamicObstacle(wx, wy, r, blocked); }
-  clearDynamicObstacles() { this.grid.clearDynamicObstacles(); }
-
-  // #E1: World Raycast & Tactical FOV Shadowcasting delegates
-  raycast(x0, y0, x1, y1, opts = {}) { return this.grid.raycast(x0, y0, x1, y1, opts); }
-  addTacticalFOV(wx, wy, r, peakCost, linearFalloff = true) { this.grid.addTacticalFOV(wx, wy, r, peakCost, linearFalloff); }
-
-  // #C2: Factory helper for SoA CrowdSystem
-  createCrowd(capacity = 4096, opts = {}) { return new CrowdSystem(this, capacity, opts); }
-
-  /**
-   * #B1 & #B2: Two-Tier Incremental Rebuild:
-   * - If `topologyDirtyChunks` is non-empty, updates regional SDF/Clearance and rebuilds affected `PortalGraph` chunks.
-   * - If only `weightsDirtyChunks` is non-empty (e.g. congestion/tactical/currents), updates CSR edge weights in-place
-   *   and preserves `PortalGraph` topology and unaffected `MacroPathfinder.goalCache` entries.
-   */
-  rebuild() {
-    const { topology, weights, all } = this.grid.consumeDirtyState();
-    if (all.size === 0) return false;
-
-    if (topology.size > 0 && (this.grid.wallPenaltyWeight > 0 || this.grid.wallRepulsionWeight > 0)) {
-      this.grid.updateWallSDF(false);
-    }
-    if (topology.size > 0 && this.grid.clearance) {
-      this.grid.updateClearance(false);
-    }
-
-    this.cache.invalidateChunks(all);
-
-    for (const [hKey, entry] of this.clearanceGraphs) {
-      if (topology.size > 0) {
-        const nextGraph = new PortalGraph(this.grid, entry.graph, all, entry.graph.minClearance, entry.graph.profile);
-        const nextMacro = new MacroPathfinder(this.grid, nextGraph);
-        this.clearanceGraphs.set(hKey, { graph: nextGraph, macro: nextMacro });
-        if (hKey === this.minClearance) {
-          this.graph = nextGraph;
-          this.macro = nextMacro;
-        }
-      } else if (weights.size > 0) {
-        // #B1: Fast path — surgical in-place CSR weight update without destroying graph or goalCache
-        entry.graph.refreshWeights(weights);
-        entry.macro.invalidateChunks(weights);
-      }
-    }
-    return true;
-  }
-
-  _getHierarchy(minClearance = this.minClearance, profile = null) {
-    if (this.grid.dirtyChunks.size > 0) this.rebuild();
-    const hKey = this._hierarchyKey(minClearance, profile);
-    let entry = this.clearanceGraphs.get(hKey);
-    if (!entry) {
-      const graph = new PortalGraph(this.grid, null, null, minClearance, profile);
-      const macro = new MacroPathfinder(this.grid, graph);
-      entry = { graph, macro };
-      this.clearanceGraphs.set(hKey, entry);
-    }
-    return entry;
-  }
-
-  /**
-   * Computes a single-goal hierarchical macro path (supports `opts.minClearance` and `opts.profile`).
-   */
-  findPath(sx, sy, gx, gy, opts = {}) {
-    const clr = opts.minClearance ?? this.minClearance;
-    const prof = opts.profile ?? null;
-    const { macro } = this._getHierarchy(clr, prof);
-    const { grid } = this;
-    const scx = clamp(sx | 0, 0, grid.width - 1), scy = clamp(sy | 0, 0, grid.height - 1);
-    const gcx = clamp(gx | 0, 0, grid.width - 1), gcy = clamp(gy | 0, 0, grid.height - 1);
-    const startCell = grid.isWalkable(scx, scy, clr, prof) ? grid.index(scx, scy) : grid.findNearestWalkable(scx, scy, 16, clr, prof);
-    const goalCell = grid.isWalkable(gcx, gcy, clr, prof) ? grid.index(gcx, gcy) : grid.findNearestWalkable(gcx, gcy, 16, clr, prof);
-    if (startCell < 0 || goalCell < 0) return null;
-    return macro.findPath(startCell, goalCell);
-  }
-
-  /**
-   * #2: Computes a Multi-Goal Geodesic Voronoi macro path to the best weighted target in `goals`.
-   */
-  findMultiGoalPath(sx, sy, goals, opts = {}) {
-    const clr = opts.minClearance ?? this.minClearance;
-    const prof = opts.profile ?? null;
-    const { macro } = this._getHierarchy(clr, prof);
-    const { grid } = this;
-    const scx = clamp(sx | 0, 0, grid.width - 1), scy = clamp(sy | 0, 0, grid.height - 1);
-    const startCell = grid.isWalkable(scx, scy, clr, prof) ? grid.index(scx, scy) : grid.findNearestWalkable(scx, scy, 16, clr, prof);
-    if (startCell < 0) return null;
-    const validTargets = [];
-    for (const g of goals) {
-      const gx = clamp(g.x | 0, 0, grid.width - 1), gy = clamp(g.y | 0, 0, grid.height - 1);
-      const cell = grid.isWalkable(gx, gy, clr, prof) ? grid.index(gx, gy) : grid.findNearestWalkable(gx, gy, 16, clr, prof);
-      if (cell >= 0) validTargets.push({ cell, weight: g.weight ?? 0 });
-    }
-    if (!validTargets.length) return null;
-    return macro.findPath(startCell, validTargets);
-  }
-
-  /**
-   * #B3: Creates a Global Reverse-Dijkstra Swarm Broadcast Field toward one or more goals.
-   * @param {Array<{x:number, y:number, weight?:number}>|{x:number, y:number}} goals
-   * @param {Object} [opts={}] - `{ minClearance, profile }`
-   */
-  createSwarmField(goals, opts = {}) {
-    const clr = opts.minClearance ?? this.minClearance;
-    const prof = opts.profile ?? null;
-    const { macro } = this._getHierarchy(clr, prof);
-    const { grid } = this;
-    const list = Array.isArray(goals) ? goals : [goals];
-    const valid = [];
-    for (const g of list) {
-      const gx = clamp(g.x | 0, 0, grid.width - 1), gy = clamp(g.y | 0, 0, grid.height - 1);
-      const cell = grid.isWalkable(gx, gy, clr, prof) ? grid.index(gx, gy) : grid.findNearestWalkable(gx, gy, 16, clr, prof);
-      if (cell >= 0) valid.push({ cell, weight: g.weight ?? 0 });
-    }
-    if (!valid.length) return null;
-    return macro.createSwarmField(valid.length === 1 && valid[0].weight === 0 ? valid[0].cell : valid);
-  }
-
-  /**
-   * #B3: Resolves the cached 16x16 flow field for the chunk at `(wx, wy)` within a `swarmField`.
-   */
-  getFieldForSwarm(swarm, wx, wy) {
-    if (!swarm) return null;
-    const { graph } = this._getHierarchy(swarm.minClearance, swarm.profile);
-    if (swarm.graph !== graph) return null;
-    const { grid } = this;
-    const cx = clamp(wx | 0, 0, grid.width - 1), cy = clamp(wy | 0, 0, grid.height - 1);
-    const chunk = grid.chunkIdAt(cx, cy);
-    return this.cache.getSwarmChunkField(chunk, swarm);
-  }
-
-  /**
-   * #B3 & #A3: Samples the bilinear flow direction `(out.x, out.y)` at `(wx, wy)` from a `swarmField`.
-   */
-  sampleSwarmFlow(swarm, wx, wy, out = { x: 0, y: 0 }) {
-    const field = this.getFieldForSwarm(swarm, wx, wy);
-    if (!field) { out.x = 0; out.y = 0; return false; }
-    const resolver = this.seamInterpolation ? (nx, ny) => {
-      if (!this.grid.inBounds(nx, ny)) return null;
-      return this.cache.getSwarmChunkField(this.grid.chunkIdAt(nx, ny), swarm);
-    } : null;
-    return sampleFlowBilinear(field, wx, wy, out, resolver);
-  }
-
-  /**
-   * #7 & #D2: Builds or retrieves a cached Vortex / Orbit flow field for the chunk at `(wx, wy)`.
-   * Supports multi-chunk orbits via `opts.centerX` and `opts.centerY` (defaults to `wx, wy`).
-   */
-  getVortexField(wx, wy, opts = {}) {
-    const { grid } = this;
-    const qx = clamp(wx | 0, 0, grid.width - 1), qy = clamp(wy | 0, 0, grid.height - 1);
-    const chunk = grid.chunkIdAt(qx, qy);
-    const cx = clamp((opts.centerX ?? wx) | 0, 0, grid.width - 1);
-    const cy = clamp((opts.centerY ?? wy) | 0, 0, grid.height - 1);
-    return this.cache.getVortexField(chunk, grid.index(cx, cy), opts);
-  }
-
-  /**
-   * #8 & #D2: Builds or retrieves a cached 2-Pass Flee safety flow field for the chunk at `(wx, wy)`
-   * supporting threats in both local and neighboring chunks.
-   */
-  getFleeField(wx, wy, threatPoints, opts = {}) {
-    const { grid } = this;
-    const cx = clamp(wx | 0, 0, grid.width - 1), cy = clamp(wy | 0, 0, grid.height - 1);
-    return this.cache.getFleeField(grid.chunkIdAt(cx, cy), threatPoints, opts);
-  }
-
-  /**
-   * #10 & #D2: Builds or retrieves a cached Guide-Curve / Spline Corridor flow field for the chunk at `(wx, wy)`.
-   */
-  getCorridorField(wx, wy, polyline, opts = {}) {
-    const { grid } = this;
-    const cx = clamp(wx | 0, 0, grid.width - 1), cy = clamp(wy | 0, 0, grid.height - 1);
-    return this.cache.getCorridorField(grid.chunkIdAt(cx, cy), polyline, opts);
-  }
-
-  /**
-   * #A1 & #D1: Resolves the 16x16 flow field for step `idx` along `path`, seeding portal exits
-   * with Cross-Boundary Wavefront Lookahead and disambiguating bisected sub-chunk pockets.
-   */
-  _resolveStepField(path, graph, stepIdx) {
-    const chunk = path.chunks[stepIdx];
-    const clr = path.minClearance ?? this.minClearance;
-    const prof = path.profile ?? null;
-    if (stepIdx >= path.portals.length) {
-      return this.cache.getGoalField(chunk, path.goalCell, clr, prof);
-    }
-    const p = graph.portals[path.portals[stepIdx]];
-    let nextField = null, nextTid = 0;
-    if (this.portalLookahead && stepIdx + 1 < path.chunks.length) {
-      const nextChunk = path.chunks[stepIdx + 1];
-      if (stepIdx + 1 < path.portals.length) {
-        const nextP = graph.portals[path.portals[stepIdx + 1]];
-        nextTid = nextP.uid;
-        nextField = this.cache.getPortalField(nextChunk, nextP, clr, null, 0, prof);
+  /** Generates local `(forward, right)` slot offsets for `count` units */
+  static generateSlots(count, formation = 'wedge', spacing = 1.25) {
+    const slots = [];
+    for (let i = 0; i < count; i++) {
+      if (formation === 'line') {
+        const right = (i - (count - 1) * 0.5) * spacing;
+        slots.push({ forward: 0, right });
+      } else if (formation === 'column') {
+        slots.push({ forward: -i * spacing, right: 0 });
+      } else if (formation === 'circle') {
+        const angle = (2 * Math.PI * i) / Math.max(1, count);
+        const rad = Math.max(spacing, (count * spacing) / (2 * Math.PI));
+        slots.push({ forward: Math.cos(angle) * rad, right: Math.sin(angle) * rad });
+      } else if (formation === 'box') {
+        const cols = Math.ceil(Math.sqrt(count));
+        const row = (i / cols) | 0, col = i % cols;
+        slots.push({ forward: -row * spacing, right: (col - (cols - 1) * 0.5) * spacing });
       } else {
-        nextTid = path.goalCell + 1;
-        nextField = this.cache.getGoalField(nextChunk, path.goalCell, clr, prof);
+        // Default: 'wedge' / V-formation
+        if (i === 0) slots.push({ forward: 0, right: 0 });
+        else {
+          const rank = ((i + 1) >> 1), side = (i & 1) ? 1 : -1;
+          slots.push({ forward: -rank * spacing * 0.85, right: side * rank * spacing * 0.75 });
+        }
       }
     }
-    return this.cache.getPortalField(chunk, p, clr, nextField, nextTid, prof);
+    return slots;
   }
 
-  /**
-   * Resolves the 16x16 flow field for the chunk at `(wx, wy)` along a given `path`.
-   * #D1: If a bisected chunk is visited multiple times along `path`, searches for the pocket where `(wx, wy)` is reachable.
-   */
-  getFieldForPath(path, wx, wy, hintIdx = 0) {
-    if (!path) return null;
-    const clr = path.minClearance ?? this.minClearance;
-    const prof = path.profile ?? null;
-    const { graph } = this._getHierarchy(clr, prof);
-    if (path.graph !== graph) return null;
-    const { grid } = this;
-    const cx = clamp(wx | 0, 0, grid.width - 1), cy = clamp(wy | 0, 0, grid.height - 1);
-    const chunk = grid.chunkIdAt(cx, cy);
-    const localIdx = (cy % CS) * CS + (cx % CS);
+  createSquad(leaderX, leaderY, agentIds, { formation = 'wedge', spacing = 1.25, speed = 3.0, path = null, maxLagDist = 5.0 } = {}) {
+    const id = this._nextSquadId++;
+    const slots = SquadSystem.generateSlots(agentIds.length, formation, spacing);
+    const members = agentIds.map((agentId, idx) => ({
+      agentId,
+      forward: slots[idx].forward,
+      right: slots[idx].right
+    }));
+    const squad = {
+      id, leaderX, leaderY, dirX: 1, dirY: 0,
+      speed, formation, spacing, path,
+      leaderHintIdx: 0, maxLagDist, members
+    };
+    this.squads.set(id, squad);
+    return squad;
+  }
 
-    // Check hintIdx first
-    if (hintIdx >= 0 && hintIdx < path.chunks.length && path.chunks[hintIdx] === chunk) {
-      const f = this._resolveStepField(path, graph, hintIdx);
-      if (f.integration[localIdx] < Infinity) return { field: f, chunkIndex: hintIdx };
+  setSquadFormation(squadId, formation, spacing = 1.25) {
+    const sq = this.squads.get(squadId);
+    if (!sq) return;
+    sq.formation = formation; sq.spacing = spacing;
+    const slots = SquadSystem.generateSlots(sq.members.length, formation, spacing);
+    for (let i = 0; i < sq.members.length; i++) {
+      sq.members[i].forward = slots[i].forward;
+      sq.members[i].right = slots[i].right;
     }
+  }
 
-    // #D1: Search forward then backward for a matching chunk occurrence where `localIdx` is reachable
-    for (let i = Math.max(0, hintIdx); i < path.chunks.length; i++) {
-      if (path.chunks[i] === chunk) {
-        const f = this._resolveStepField(path, graph, i);
-        if (f.integration[localIdx] < Infinity) return { field: f, chunkIndex: i };
+  setSquadTarget(squadId, pathOrSwarm) {
+    const sq = this.squads.get(squadId);
+    if (!sq) return;
+    sq.path = pathOrSwarm;
+    sq.leaderHintIdx = 0;
+  }
+
+  step(dt = 1 / 60) {
+    const { pf, crowd, _vec } = this;
+    for (const sq of this.squads.values()) {
+      const { path, members } = sq;
+      if (!path || members.length === 0) continue;
+
+      // Measure squad cohesion lag to rubber-band virtual leader speed
+      let sumLag = 0;
+      for (let i = 0; i < members.length; i++) {
+        const aid = members[i].agentId;
+        const d = Math.hypot(crowd.px[aid] - sq.leaderX, crowd.py[aid] - sq.leaderY);
+        const expected = Math.hypot(members[i].forward, members[i].right);
+        if (d > expected) sumLag += (d - expected);
+      }
+      const avgLag = sumLag / members.length;
+      const throttle = clamp(1 - avgLag / Math.max(1, sq.maxLagDist), 0.15, 1.0);
+
+      // Advance virtual squad leader along path/swarm
+      let ok = false;
+      if (path.isSwarm) {
+        ok = pf.sampleSwarmFlow(path, sq.leaderX, sq.leaderY, _vec);
+      } else {
+        const res = pf.getFieldForPath(path, sq.leaderX, sq.leaderY, sq.leaderHintIdx);
+        if (res) {
+          sq.leaderHintIdx = res.chunkIndex;
+          ok = sampleFlowBilinear(res.field, sq.leaderX, sq.leaderY, _vec);
+        }
+      }
+      if (ok) {
+        sq.dirX = _vec.x; sq.dirY = _vec.y;
+        const gx = path.goalX ?? -1, gy = path.goalY ?? -1;
+        if (gx < 0 || Math.hypot(gx - sq.leaderX, gy - sq.leaderY) > 0.6) {
+          sq.leaderX = clamp(sq.leaderX + _vec.x * sq.speed * throttle * dt, 0.5, pf.width - 0.5);
+          sq.leaderY = clamp(sq.leaderY + _vec.y * sq.speed * throttle * dt, 0.5, pf.height - 0.5);
+        }
+      }
+
+      // Steer each squad member using clearance-adaptive formation flow (#C4)
+      for (let i = 0; i < members.length; i++) {
+        const m = members[i], aid = m.agentId;
+        if (!crowd.active[aid]) continue;
+        if (pf.sampleFormationFlow(path, sq.leaderX, sq.leaderY, m.forward, m.right, crowd.px[aid], crowd.py[aid], _vec, {
+          leaderHintIdx: sq.leaderHintIdx,
+          agentHintIdx: crowd.hintIdx[aid]
+        })) {
+          crowd.vx[aid] = _vec.x * crowd.speed[aid];
+          crowd.vy[aid] = _vec.y * crowd.speed[aid];
+        }
       }
     }
-    for (let i = Math.min(path.chunks.length - 1, hintIdx - 1); i >= 0; i--) {
-      if (path.chunks[i] === chunk) {
-        const f = this._resolveStepField(path, graph, i);
-        if (f.integration[localIdx] < Infinity) return { field: f, chunkIndex: i };
-      }
-    }
-    return null;
-  }
-
-  /**
-   * #A3: Samples the bilinear flow direction `(out.x, out.y)` at `(wx, wy)` along `path`,
-   * smoothly blending across chunk boundaries when within 0.5 cells of a chunk seam.
-   */
-  sampleFlow(path, wx, wy, out = { x: 0, y: 0 }, hintIdx = 0) {
-    const res = this.getFieldForPath(path, wx, wy, hintIdx);
-    if (!res) { out.x = 0; out.y = 0; return false; }
-    const resolver = this.seamInterpolation ? (nx, ny) => {
-      if (!this.grid.inBounds(nx, ny)) return null;
-      const nRes = this.getFieldForPath(path, nx, ny, res.chunkIndex);
-      return nRes ? nRes.field : null;
-    } : null;
-    return sampleFlowBilinear(res.field, wx, wy, out, resolver);
-  }
-
-  /**
-   * #C4: Clearance-Adaptive Squad / Formation Flow Sampler.
-   * Rotates the formation offset `(slotForward, slotRight)` along the leader's heading,
-   * automatically compresses lateral spacing through narrow doorways/corridors using the clearance map,
-   * and blends the slot-seeking vector with the agent's local path flow.
-   */
-  sampleFormationFlow(pathOrSwarm, leaderX, leaderY, slotForward, slotRight, agentX, agentY, out = { x: 0, y: 0 }, opts = {}) {
-    const { grid, _tmpVec } = this;
-    const isSwarm = pathOrSwarm && pathOrSwarm.isSwarm;
-    const okLeader = isSwarm
-      ? this.sampleSwarmFlow(pathOrSwarm, leaderX, leaderY, _tmpVec)
-      : this.sampleFlow(pathOrSwarm, leaderX, leaderY, _tmpVec, opts.leaderHintIdx ?? 0);
-    const lfx = okLeader ? _tmpVec.x : 1, lfy = okLeader ? _tmpVec.y : 0;
-
-    if (grid._clearanceDirty || !grid.clearance) grid.updateClearance();
-    const lCell = grid.index(clamp(leaderX | 0, 0, grid.width - 1), clamp(leaderY | 0, 0, grid.height - 1));
-    const localClr = grid.clearance[lCell];
-    const formRadius = opts.formationRadius ?? Math.max(1.5, Math.abs(slotRight));
-    const scale = clamp(localClr / formRadius, opts.minCompression ?? 0.2, 1.0);
-
-    // Rotate compressed local slot into world space relative to leader flow tangent
-    const rightX = -lfy, rightY = lfx;
-    const targetX = leaderX + lfx * slotForward + rightX * (slotRight * scale);
-    const targetY = leaderY + lfy * slotForward + rightY * (slotRight * scale);
-
-    const okAgent = isSwarm
-      ? this.sampleSwarmFlow(pathOrSwarm, agentX, agentY, out)
-      : this.sampleFlow(pathOrSwarm, agentX, agentY, out, opts.agentHintIdx ?? 0);
-    const afx = okAgent ? out.x : lfx, afy = okAgent ? out.y : lfy;
-
-    const dx = targetX - agentX, dy = targetY - agentY, dist = Math.hypot(dx, dy);
-    const springW = clamp(dist * (opts.slotGain ?? 0.6), 0, opts.maxSlotWeight ?? 1.25);
-    const sx = dist > 1e-4 ? (dx / dist) * springW : 0;
-    const sy = dist > 1e-4 ? (dy / dist) * springW : 0;
-
-    const bx = afx + sx, by = afy + sy, bl = Math.hypot(bx, by);
-    if (bl < 1e-6) { out.x = 0; out.y = 0; return false; }
-    out.x = bx / bl; out.y = by / bl;
-    return true;
   }
 }
-
-export default FlowFieldPathfinder;
 //#endregion
