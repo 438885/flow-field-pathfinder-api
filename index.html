@@ -1,0 +1,1162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Single-Agent Multi-Stage Flow-Field Obstacle Course</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #111;
+      color: #ddd;
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      border-bottom: 1px solid #333;
+      padding-bottom: 8px;
+      margin-bottom: 10px;
+    }
+    .controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    button, select {
+      background: #1e1e1e;
+      color: #ddd;
+      border: 1px solid #444;
+      padding: 4px 8px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:hover, select:hover { border-color: #888; }
+    button.active { background: #2c4a3e; border-color: #52b788; color: #fff; }
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr 310px;
+      gap: 12px;
+      align-items: start;
+    }
+    @media (max-width: 960px) { .layout { grid-template-columns: 1fr; } }
+    .canvas-wrap {
+      border: 1px solid #333;
+      background: #0a0a0a;
+      overflow: auto;
+    }
+    canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+    .panel {
+      border: 1px solid #333;
+      background: #161616;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .section-title {
+      font-weight: bold;
+      color: #fff;
+      border-bottom: 1px solid #2a2a2a;
+      padding-bottom: 4px;
+      margin-bottom: 4px;
+    }
+    .kv { display: flex; justify-content: space-between; color: #aaa; }
+    .kv span:last-child { color: #eee; }
+    .feature-list { list-style: none; color: #9ec5fe; }
+    .feature-list li::before { content: "→ "; color: #666; }
+    .stage-pills { display: flex; gap: 4px; flex-wrap: wrap; }
+    .stage-pill {
+      padding: 2px 6px;
+      border: 1px solid #333;
+      cursor: pointer;
+      color: #888;
+    }
+    .stage-pill.current { border-color: #4dabf7; color: #fff; background: #183148; }
+    .stage-pill.done { border-color: #2b8a3e; color: #8ce99a; }
+    .legend { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; font-size: 11px; color: #aaa; }
+    .swatch { display: inline-block; width: 10px; height: 10px; margin-right: 5px; vertical-align: middle; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <strong id="stageHeader">Loading flow-field-pathfinder-api-alt.js...</strong>
+    </div>
+    <div class="controls">
+      <button id="btnPrev">◀ Prev</button>
+      <button id="btnNext">Next ▶</button>
+      <button id="btnPause">Pause</button>
+      <button id="btnReset">Reset Stage</button>
+      <button id="btnAuto" class="active">Auto-Advance: ON</button>
+      <label>
+        Vis:
+        <select id="visMode">
+          <option value="flow">Flow Vectors + Cost</option>
+          <option value="integration">Integration Heatmap</option>
+          <option value="clearance">Clearance (C / CX / CY)</option>
+          <option value="sdf">Wall SDF + Gradients</option>
+          <option value="portals">Chunks & Detected Portals</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <div class="layout">
+    <div class="canvas-wrap">
+      <canvas id="simCanvas" width="768" height="512"></canvas>
+    </div>
+
+    <div class="panel">
+      <div>
+        <div class="section-title">Obstacle Course Progress</div>
+        <div id="stagePills" class="stage-pills"></div>
+      </div>
+
+      <div>
+        <div class="section-title">Stage Brief</div>
+        <div id="stageDesc" style="color:#bbb;">Initializing...</div>
+      </div>
+
+      <div>
+        <div class="section-title">Active API Features</div>
+        <ul id="stageFeatures" class="feature-list"></ul>
+      </div>
+
+      <div>
+        <div class="section-title">Single-Agent Telemetry</div>
+        <div class="kv"><span>Position (x, y, z):</span><span id="telPos">-</span></div>
+        <div class="kv"><span>Velocity (vx, vy):</span><span id="telVel">-</span></div>
+        <div class="kv"><span>Profile / Clearance:</span><span id="telProf">-</span></div>
+        <div class="kv"><span>Cell Integration Dist:</span><span id="telDist">-</span></div>
+        <div class="kv"><span>LOS Raycast to Goal:</span><span id="telRay">-</span></div>
+        <div class="kv"><span>Detected Portals:</span><span id="telPortals">-</span></div>
+        <div class="kv"><span>Stage Elapsed:</span><span id="telTime">-</span></div>
+      </div>
+
+      <div>
+        <div class="section-title">Legend</div>
+        <div class="legend">
+          <div><span class="swatch" style="background:#52b788"></span>Agent-01</div>
+          <div><span class="swatch" style="background:#fcc419"></span>Goal / Waypoint</div>
+          <div><span class="swatch" style="background:#444"></span>Wall (COST_BLOCK)</div>
+          <div><span class="swatch" style="background:#e03131"></span>Tactical / Dynamic</div>
+          <div><span class="swatch" style="background:#1c7ed6"></span>Water / Current</div>
+          <div><span class="swatch" style="background:#ae3ec9"></span>Stair / 2.5D Layer 1</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    const API_URL = 'https://raw.githubusercontent.com/438885/flow-field-pathfinder-api/refs/heads/main/flow-field-pathfinder-api-alt.js';
+
+    async function loadPathfinderAPI(url) {
+      try {
+        return await import(url);
+      } catch (_) {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+        const source = await res.text();
+        const blob = new Blob([source], { type: 'text/javascript' });
+        const blobUrl = URL.createObjectURL(blob);
+        return await import(blobUrl);
+      }
+    }
+
+    const FF = await loadPathfinderAPI(API_URL);
+    const {
+      CS, CC, COST_OPEN, COST_BLOCK, MAX_PORTAL_LEN,
+      DX, DY, DL, DIR_FLAGS, clamp,
+      MinHeap, GridWorld, detectPortals, crossingCost, ChunkIntegrator
+    } = FF;
+
+    const canvas = document.getElementById('simCanvas');
+    const ctx = canvas.getContext('2d');
+    const CELL_PX = 16; // 48x32 cells = 768x512 px (3x2 chunks of 16x16)
+    const CX = 3, CY = 2;
+
+    // Reusable ChunkIntegrator from flow-field-pathfinder-api-alt.js
+    const chunkIntegrator = new ChunkIntegrator();
+    const solverHeap = new MinHeap(4096);
+
+    // Simulation state
+    let currentStageIdx = 0;
+    let completedStages = new Set();
+    let paused = false;
+    let autoAdvance = true;
+    let stageTime = 0;
+    let stageState = {};
+    let grid = null;
+    let portals = [];
+    let field = null; // { integration, flowX, flowY, portalNextZ }
+
+    const agent = {
+      x: 4.5,
+      y: 16.5,
+      z: 0,
+      vx: 0,
+      vy: 0,
+      speed: 7.5,
+      radius: 0.38,
+      profile: null,
+      minClearance: 1,
+      footprint: null,
+      trail: []
+    };
+
+    let goal = { x: 43.5, y: 16.5, z: 0 };
+
+    // -------------------------------------------------------------------------
+    // Multi-Layer Flow-Field Solver backed by GridWorld + ChunkIntegrator
+    // -------------------------------------------------------------------------
+    function solveFlowField(grid, targetX, targetY, targetZ = 0, minClearance = 1, profile = null, footprint = null) {
+      const W = grid.width, H = grid.height, L = grid.layers, LC = grid.layerCells;
+      const totalCells = LC * L;
+
+      // 1. Run ChunkIntegrator.prepareChunk across every chunk in the GridWorld
+      const cellCosts = new Float32Array(totalCells);
+      const cellBlocked = new Uint8Array(totalCells);
+      const cellDirMasks = new Uint8Array(totalCells);
+      const cellTurnPen = new Float32Array(totalCells);
+      const cellCurX = new Float32Array(totalCells);
+      const cellCurY = new Float32Array(totalCells);
+      const cellFluxX = new Float32Array(totalCells);
+      const cellFluxY = new Float32Array(totalCells);
+
+      for (let c = 0; c < grid.chunkCount; c++) {
+        chunkIntegrator.prepareChunk(grid, c, minClearance, profile, footprint);
+        const z = grid.chunkLayer(c);
+        const ox = grid.chunkOriginX(c);
+        const oy = grid.chunkOriginY(c);
+        const zOff = z * LC;
+
+        for (let ly = 0; ly < CS; ly++) {
+          const gy = oy + ly;
+          const rowOff = zOff + gy * W;
+          const lRow = ly * CS;
+          for (let lx = 0; lx < CS; lx++) {
+            const k = lRow + lx;
+            const gIdx = rowOff + ox + lx;
+            cellCosts[gIdx] = chunkIntegrator.costs[k];
+            cellBlocked[gIdx] = chunkIntegrator.blocked[k];
+            cellDirMasks[gIdx] = chunkIntegrator.dirMasks[k];
+            cellTurnPen[gIdx] = chunkIntegrator.turnPenaltyCell[k];
+            cellCurX[gIdx] = chunkIntegrator.curX[k];
+            cellCurY[gIdx] = chunkIntegrator.curY[k];
+            cellFluxX[gIdx] = chunkIntegrator.fluxX[k];
+            cellFluxY[gIdx] = chunkIntegrator.fluxY[k];
+          }
+        }
+      }
+
+      // 2. Build fast lookup for vertical stair portals (#H3)
+      const verticalLinks = new Map();
+      for (const vp of grid.verticalPortals) {
+        for (let i = 0; i < vp.cellsA.length; i++) {
+          const a = vp.cellsA[i], b = vp.cellsB[i];
+          if (vp.canAB) {
+            if (!verticalLinks.has(a)) verticalLinks.set(a, []);
+            verticalLinks.get(a).push({ toCell: b, toLayer: vp.layerB, cost: vp.cost ?? COST_OPEN });
+          }
+          if (vp.canBA) {
+            if (!verticalLinks.has(b)) verticalLinks.set(b, []);
+            verticalLinks.get(b).push({ toCell: a, toLayer: vp.layerA, cost: vp.cost ?? COST_OPEN });
+          }
+        }
+      }
+
+      // 3. Backward wavefront integration from goal using FF.MinHeap
+      const integration = new Float32Array(totalCells).fill(Infinity);
+      const flowX = new Float32Array(totalCells);
+      const flowY = new Float32Array(totalCells);
+      const portalNextZ = new Int8Array(totalCells).fill(-1);
+
+      let gx = clamp(Math.floor(targetX), 0, W - 1);
+      let gy = clamp(Math.floor(targetY), 0, H - 1);
+      let gz = clamp(targetZ | 0, 0, L - 1);
+      let goalIdx = grid.index(gx, gy, gz);
+
+      if (cellBlocked[goalIdx]) {
+        const nearest = grid.findNearestWalkable(gx, gy, 24, minClearance, profile, gz, footprint);
+        if (nearest >= 0) goalIdx = nearest;
+      }
+
+      solverHeap.clear();
+      integration[goalIdx] = 0;
+      solverHeap.push(goalIdx, 0);
+
+      while (!solverHeap.isEmpty) {
+        const curr = solverHeap.pop();
+        const currDist = integration[curr];
+        if (solverHeap.lastKey > currDist + 1e-4) continue;
+
+        const z = (curr / LC) | 0;
+        const rem = curr % LC;
+        const cx = rem % W;
+        const cy = (rem / W) | 0;
+        const zOff = z * LC;
+
+        // Relax 8 neighbors (backward from curr -> neighbor n steps FROM n TO curr)
+        for (let d = 0; d < 8; d++) {
+          const nx = cx + DX[d];
+          const ny = cy + DY[d];
+          if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+          const nIdx = zOff + ny * W + nx;
+          if (cellBlocked[nIdx]) continue;
+
+          // Prevent diagonal corner cutting through blocked cells
+          if (d >= 4) {
+            if (cellBlocked[zOff + cy * W + nx] || cellBlocked[zOff + ny * W + cx]) continue;
+          }
+
+          // Direction from neighbor (nx, ny) -> (cx, cy) is opposite of d
+          const moveDx = -DX[d], moveDy = -DY[d];
+          const revDir = d ^ 1;
+          const moveBit = 1 << revDir;
+          if ((cellDirMasks[nIdx] & moveBit) === 0) continue;
+
+          const stepLen = DL[d];
+          let wCost = (cellCosts[nIdx] + cellCosts[curr]) * 0.5 / COST_OPEN;
+          if (cellTurnPen[nIdx] > 0 && d >= 4) wCost += cellTurnPen[nIdx] * 0.25;
+
+          // Anisotropic current & slope modulation (#11, #A5)
+          const ux = moveDx / stepLen, uy = moveDy / stepLen;
+          const curDot = ux * cellCurX[nIdx] + uy * cellCurY[nIdx];
+          if (curDot !== 0) {
+            wCost *= clamp(1 - curDot * grid.currentStrength, 0.2, 4.0);
+          }
+
+          // Continuum crowd velocity-flux alignment (#C1)
+          const fx = cellFluxX[nIdx], fy = cellFluxY[nIdx];
+          if (fx !== 0 || fy !== 0) {
+            const fMag = Math.hypot(fx, fy);
+            const fDot = (ux * fx + uy * fy) / (fMag + 1e-5);
+            wCost *= clamp(1 - fDot * grid.congestionLaneWeight * 0.5, 0.4, 2.5);
+          }
+
+          const cand = currDist + stepLen * wCost;
+          if (cand < integration[nIdx]) {
+            integration[nIdx] = cand;
+            solverHeap.push(nIdx, cand);
+          }
+        }
+
+        // Relax vertical stair portals (#H3)
+        // If someone steps from 'other' -> 'curr', check links on 'other' that point to 'curr'
+        const vLinks = verticalLinks.get(curr);
+        if (vLinks) {
+          for (const link of vLinks) {
+            const oIdx = link.toCell;
+            if (cellBlocked[oIdx]) continue;
+            const cand = currDist + (link.cost / COST_OPEN);
+            if (cand < integration[oIdx]) {
+              integration[oIdx] = cand;
+              solverHeap.push(oIdx, cand);
+            }
+          }
+        }
+      }
+
+      // 4. Compute flow vectors (steepest descent + central finite difference + wall repulsion)
+      const useWallRep = grid.wallRepulsionWeight > 0 && grid.wallDist;
+      for (let z = 0; z < L; z++) {
+        const zOff = z * LC;
+        for (let y = 0; y < H; y++) {
+          for (let x = 0; x < W; x++) {
+            const idx = zOff + y * W + x;
+            const d0 = integration[idx];
+            if (!Number.isFinite(d0) || idx === goalIdx) continue;
+
+            // Check if a vertical portal transitions directly to another layer with lower integration
+            const vLinks = verticalLinks.get(idx);
+            if (vLinks) {
+              for (const link of vLinks) {
+                if (integration[link.toCell] + 0.05 < d0) {
+                  portalNextZ[idx] = link.toLayer;
+                }
+              }
+            }
+
+            let bestDx = 0, bestDy = 0, bestDrop = 0;
+            const mask = cellDirMasks[idx];
+            for (let d = 0; d < 8; d++) {
+              if ((mask & (1 << d)) === 0) continue;
+              const nx = x + DX[d], ny = y + DY[d];
+              if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+              const nIdx = zOff + ny * W + nx;
+              if (d >= 4 && (cellBlocked[zOff + y * W + nx] || cellBlocked[zOff + ny * W + x])) continue;
+              const nd = integration[nIdx];
+              if (!Number.isFinite(nd)) continue;
+              const drop = (d0 - nd) / DL[d];
+              if (drop > bestDrop) {
+                bestDrop = drop;
+                bestDx = DX[d];
+                bestDy = DY[d];
+              }
+            }
+
+            // Smooth Eikonal gradient when orthogonal neighbors are valid
+            const dE = x < W - 1 && (mask & DIR_FLAGS.E) ? integration[idx + 1] : d0;
+            const dW = x > 0 && (mask & DIR_FLAGS.W) ? integration[idx - 1] : d0;
+            const dS = y < H - 1 && (mask & DIR_FLAGS.S) ? integration[idx + W] : d0;
+            const dN = y > 0 && (mask & DIR_FLAGS.N) ? integration[idx - W] : d0;
+
+            let gx = Number.isFinite(dE) && Number.isFinite(dW) ? (dW - dE) * 0.5 : bestDx;
+            let gy = Number.isFinite(dS) && Number.isFinite(dN) ? (dN - dS) * 0.5 : bestDy;
+            if (gx * bestDx + gy * bestDy <= 0) {
+              gx = bestDx;
+              gy = bestDy;
+            }
+
+            const len = Math.hypot(gx, gy);
+            if (len > 1e-5) {
+              gx /= len;
+              gy /= len;
+            }
+
+            // Blend SDF wall repulsion gradient (#4)
+            if (useWallRep) {
+              const wd = grid.wallDist[idx];
+              if (wd > 0 && wd < grid.wallPenaltyRadius) {
+                const rep = grid.wallRepulsionWeight * (1 - wd / grid.wallPenaltyRadius);
+                gx += grid.wallGradX[idx] * rep;
+                gy += grid.wallGradY[idx] * rep;
+                const nl = Math.hypot(gx, gy);
+                if (nl > 1e-5) { gx /= nl; gy /= nl; }
+              }
+            }
+
+            flowX[idx] = gx;
+            flowY[idx] = gy;
+          }
+        }
+      }
+
+      return { integration, flowX, flowY, portalNextZ, cellCosts, cellBlocked };
+    }
+
+    // -------------------------------------------------------------------------
+    // 7-Stage Obstacle Course Definitions
+    // -------------------------------------------------------------------------
+    const STAGES = [
+      {
+        name: 'Stage 1: Eikonal SDF Wall Repulsion & LOS Raycast',
+        desc: 'Agent navigates a staggered pillar gauntlet. Signed Distance Field (SDF) wall repulsion pushes the trajectory smoothly away from sharp corners until grid.raycast() confirms clear line-of-sight.',
+        features: [
+          'grid.enableWallRepulsion({ penaltyWeight, repulsionWeight, radius })',
+          'grid.updateWallSDF() -> wallDist, wallGradX, wallGradY',
+          'grid.setRect() & grid.setDisc()',
+          'grid.raycast(ax, ay, gx, gy)'
+        ],
+        setup() {
+          grid = new GridWorld(CX, CY);
+          // Outer border walls
+          grid.setRect(0, 0, 48, 1, COST_BLOCK);
+          grid.setRect(0, 31, 48, 1, COST_BLOCK);
+          grid.setRect(0, 0, 1, 32, COST_BLOCK);
+          grid.setRect(47, 0, 1, 32, COST_BLOCK);
+
+          // Baffle walls and circular pillars
+          grid.setRect(11, 1, 2, 20, COST_BLOCK);
+          grid.setRect(22, 11, 2, 20, COST_BLOCK);
+          grid.setRect(34, 1, 2, 19, COST_BLOCK);
+          grid.setDisc(17, 25, 2.6, COST_BLOCK);
+          grid.setDisc(28.5, 7, 2.6, COST_BLOCK);
+          grid.setDisc(40, 23, 2.4, COST_BLOCK);
+
+          grid.enableWallRepulsion({ penaltyWeight: 3.0, repulsionWeight: 0.45, radius: 3.5 });
+
+          Object.assign(agent, { x: 4.5, y: 6.5, z: 0, vx: 0, vy: 0, profile: null, minClearance: 1, footprint: null, trail: [] });
+          goal = { x: 43.5, y: 8.5, z: 0 };
+        },
+        update(dt) {}
+      },
+
+      {
+        name: 'Stage 2: Terrain IDs & Scoped Unit Movement Profiles',
+        desc: 'Agent starts with the "walker" profile (avoids deep water and mud by following the stone causeway) to reach the Amphibious Gear Pod. Touching the pod switches profile to "amphibious" to cross deep water directly.',
+        features: [
+          'grid.ensureTerrainLayer() & grid.setRectTerrain()',
+          'grid.registerProfile("walker", ...) & ("amphibious", ...)',
+          'ChunkIntegrator.prepareChunk(grid, c, 1, agent.profile)'
+        ],
+        setup() {
+          grid = new GridWorld(CX, CY);
+          grid.setRect(0, 0, 48, 1, COST_BLOCK);
+          grid.setRect(0, 31, 48, 1, COST_BLOCK);
+          grid.setRect(0, 0, 1, 32, COST_BLOCK);
+          grid.setRect(47, 0, 1, 32, COST_BLOCK);
+
+          // Terrain IDs: 0 = Normal, 1 = Mud Bog, 2 = Deep Water, 3 = Stone Causeway
+          grid.ensureTerrainLayer();
+          grid.setRectTerrain(12, 1, 14, 30, 1); // Mud bog
+          grid.setRectTerrain(26, 1, 13, 30, 2); // Deep water lake
+          // Winding stone causeway through the mud bog to the gear pod
+          grid.setRectTerrain(11, 24, 15, 3, 3);
+          grid.setRectTerrain(23, 6, 3, 20, 3);
+
+          grid.registerProfile('walker', { 0: 2, 1: 28, 2: 254, 3: 1 });
+          grid.registerProfile('amphibious', { 0: 2, 1: 4, 2: 2, 3: 2 });
+
+          stageState = {
+            podPicked: false,
+            pod: { x: 24.5, y: 7.5 },
+            finalGoal: { x: 43.5, y: 16.5, z: 0 }
+          };
+
+          Object.assign(agent, { x: 4.5, y: 8.5, z: 0, vx: 0, vy: 0, profile: 'walker', minClearance: 1, footprint: null, trail: [] });
+          goal = { x: stageState.pod.x, y: stageState.pod.y, z: 0 };
+        },
+        update(dt) {
+          if (!stageState.podPicked && Math.hypot(agent.x - stageState.pod.x, agent.y - stageState.pod.y) < 1.3) {
+            stageState.podPicked = true;
+            agent.profile = 'amphibious';
+            goal = { ...stageState.finalGoal };
+            rebuildStageField();
+          }
+        }
+      },
+
+      {
+        name: 'Stage 3: Brushfire Clearance & Vehicle Footprint',
+        desc: 'Agent hauls a wide rectangular rig (minClearance: 2, footprint: 2x3). Narrow 1-cell and 2-cell gaps in the central divider are automatically rejected by updateClearance(); the agent routes through the wide freight bay.',
+        features: [
+          'grid.updateClearance() -> clearance, clearanceX, clearanceY',
+          'grid.isWalkable(x, y, minClearance, profile, z, footprint)',
+          'detectPortals(grid, 2, MAX_PORTAL_LEN, null, footprint)'
+        ],
+        setup() {
+          grid = new GridWorld(CX, CY);
+          grid.setRect(0, 0, 48, 1, COST_BLOCK);
+          grid.setRect(0, 31, 48, 1, COST_BLOCK);
+          grid.setRect(0, 0, 1, 32, COST_BLOCK);
+          grid.setRect(47, 0, 1, 32, COST_BLOCK);
+
+          // Central wall with 3 openings of different widths:
+          // Top opening: 1 cell wide (y=6..7) - too narrow!
+          // Middle opening: 2 cells wide (y=15..17) - too narrow for minClearance=2!
+          // Bottom freight bay: 6 cells wide (y=23..29) - wide enough!
+          grid.setRect(22, 1, 3, 5, COST_BLOCK);
+          grid.setRect(22, 7, 3, 8, COST_BLOCK);
+          grid.setRect(22, 17, 3, 6, COST_BLOCK);
+          grid.setRect(22, 29, 3, 2, COST_BLOCK);
+
+          // Secondary chicane requiring wide clearance
+          grid.setRect(34, 10, 2, 21, COST_BLOCK);
+
+          grid.enableWallRepulsion({ penaltyWeight: 1.8, repulsionWeight: 0.35, radius: 2.5 });
+          grid.updateClearance(true);
+
+          const footprint = { width: 2, length: 3, turnPenalty: 2.5 };
+          Object.assign(agent, { x: 5.5, y: 6.5, z: 0, vx: 0, vy: 0, profile: null, minClearance: 2, footprint, trail: [] });
+          goal = { x: 42.5, y: 6.5, z: 0 };
+        },
+        update(dt) {}
+      },
+
+      {
+        name: 'Stage 4: Anisotropic One-Way Gates & Vector Currents',
+        desc: 'Center shortcut is blocked by a West-only one-way diode mask (DIR_FLAGS.W) and strong opposing headwind current. Agent takes the lower Eastbound jet stream and sloped ramp to ride the tailwind.',
+        features: [
+          'grid.setDirectionMask(x, y, DIR_FLAGS.E / W)',
+          'grid.setRectCurrent(x, y, w, h, vx, vy)',
+          'grid.setSlopeFromHeightmap(heights, slopeScale)'
+        ],
+        setup() {
+          grid = new GridWorld(CX, CY);
+          grid.setRect(0, 0, 48, 1, COST_BLOCK);
+          grid.setRect(0, 31, 48, 1, COST_BLOCK);
+          grid.setRect(0, 0, 1, 32, COST_BLOCK);
+          grid.setRect(47, 0, 1, 32, COST_BLOCK);
+
+          // Horizontal channel dividers creating 3 lanes (Top, Middle, Bottom)
+          grid.setRect(10, 10, 28, 2, COST_BLOCK);
+          grid.setRect(10, 20, 28, 2, COST_BLOCK);
+
+          // Gentle heightmap slope across the map
+          const heights = new Float32Array(grid.width * grid.height);
+          for (let y = 0; y < grid.height; y++) {
+            for (let x = 0; x < grid.width; x++) {
+              heights[y * grid.width + x] = Math.sin(x * 0.15) * 0.4;
+            }
+          }
+          grid.setSlopeFromHeightmap(heights, 0.5);
+          grid.currentStrength = 0.85;
+
+          // Top lane: strong opposing current (-1.2, 0)
+          grid.setRectCurrent(10, 1, 28, 9, -1.2, 0);
+
+          // Middle lane: West-only one-way turnstile gate (cannot pass Eastward)
+          for (let y = 12; y < 20; y++) {
+            for (let x = 22; x <= 25; x++) {
+              grid.setDirectionMask(x, y, DIR_FLAGS.W);
+            }
+          }
+
+          // Bottom lane: strong Eastbound tailwind current (+1.1, 0) + East-only diode
+          grid.setRectCurrent(10, 22, 28, 9, 1.1, 0);
+          for (let y = 22; y < 31; y++) {
+            grid.setDirectionMask(15, y, DIR_FLAGS.E | DIR_FLAGS.NE | DIR_FLAGS.SE);
+          }
+
+          Object.assign(agent, { x: 4.5, y: 16.0, z: 0, vx: 0, vy: 0, profile: null, minClearance: 1, footprint: null, trail: [] });
+          goal = { x: 43.5, y: 16.0, z: 0 };
+        },
+        update(dt) {}
+      },
+
+      {
+        name: 'Stage 5: Tactical Overlay & Shadowcasted FOV Cones',
+        desc: 'Two watchtowers project real-time shadowcasted visibility fields via addTacticalFOV(). Opaque cover blocks cast safe shadows; the agent dynamically routes through the low-cost shadow corridors.',
+        features: [
+          'grid.clearTacticalCosts()',
+          'grid.addTacticalFOV(wx, wy, r, peakCost, true, onVisibleCell)',
+          'grid.addTacticalDisc(wx, wy, r, peakCost)'
+        ],
+        setup() {
+          grid = new GridWorld(CX, CY);
+          grid.setRect(0, 0, 48, 1, COST_BLOCK);
+          grid.setRect(0, 31, 48, 1, COST_BLOCK);
+          grid.setRect(0, 0, 1, 32, COST_BLOCK);
+          grid.setRect(47, 0, 1, 32, COST_BLOCK);
+
+          // Cover walls that cast shadows against the watchtowers
+          grid.setRect(13, 6, 3, 7, COST_BLOCK);
+          grid.setRect(13, 19, 3, 7, COST_BLOCK);
+          grid.setRect(24, 12, 4, 8, COST_BLOCK);
+          grid.setRect(34, 6, 3, 7, COST_BLOCK);
+          grid.setRect(34, 19, 3, 7, COST_BLOCK);
+
+          stageState = {
+            towers: [
+              { x: 20.5, y: 4.5, r: 16 },
+              { x: 29.5, y: 27.5, r: 16 }
+            ],
+            pulsePhase: 0
+          };
+
+          Object.assign(agent, { x: 4.5, y: 16.0, z: 0, vx: 0, vy: 0, profile: null, minClearance: 1, footprint: null, trail: [] });
+          goal = { x: 43.5, y: 16.0, z: 0 };
+          this.update(0);
+        },
+        update(dt) {
+          stageState.pulsePhase += dt * 2.2;
+          grid.clearTacticalCosts();
+          for (let i = 0; i < stageState.towers.length; i++) {
+            const t = stageState.towers[i];
+            const radius = t.r + Math.sin(stageState.pulsePhase + i * Math.PI) * 2.5;
+            grid.addTacticalFOV(t.x, t.y, radius, 42, true);
+            grid.addTacticalDisc(t.x, t.y, 3.0, 60, true);
+          }
+          rebuildStageField();
+        }
+      },
+
+      {
+        name: 'Stage 6: Dynamic Moving Obstacles & Velocity-Flux Lanes',
+        desc: 'Reciprocating crusher pistons stamp dynamic obstacles (stampDynamicObstacle) while cross-traffic emitter streams inject continuum crowd congestion and velocity flux (addAgentFlux, decayCongestion).',
+        features: [
+          'grid.clearDynamicObstacles() & grid.stampDynamicObstacle()',
+          'grid.addAgentFlux(wx, wy, vx, vy, amount)',
+          'grid.decayCongestion(decayFactor)'
+        ],
+        setup() {
+          grid = new GridWorld(CX, CY);
+          grid.setRect(0, 0, 48, 1, COST_BLOCK);
+          grid.setRect(0, 31, 48, 1, COST_BLOCK);
+          grid.setRect(0, 0, 1, 32, COST_BLOCK);
+          grid.setRect(47, 0, 1, 32, COST_BLOCK);
+
+          // Housing walls for pistons
+          grid.setRect(15, 1, 2, 8, COST_BLOCK);
+          grid.setRect(15, 23, 2, 8, COST_BLOCK);
+          grid.setRect(31, 1, 2, 8, COST_BLOCK);
+          grid.setRect(31, 23, 2, 8, COST_BLOCK);
+
+          grid.congestionWeight = 2.0;
+          grid.congestionLaneWeight = 0.85;
+
+          stageState = {
+            phase: 0,
+            pistons: [
+              { x: 16.0, baseY: 16.0, amp: 5.5, freq: 1.5, offset: 0, r: 2.2 },
+              { x: 32.0, baseY: 16.0, amp: 5.5, freq: 1.5, offset: Math.PI, r: 2.2 }
+            ],
+            fluxParticles: Array.from({ length: 18 }, (_, i) => ({
+              x: 21 + (i % 3) * 3,
+              y: (i * 5) % 28 + 2,
+              vx: 0,
+              vy: i % 2 === 0 ? 5.5 : -5.5
+            }))
+          };
+
+          Object.assign(agent, { x: 4.5, y: 16.0, z: 0, vx: 0, vy: 0, profile: null, minClearance: 1, footprint: null, trail: [] });
+          goal = { x: 43.5, y: 16.0, z: 0 };
+          this.update(0);
+        },
+        update(dt) {
+          stageState.phase += dt;
+          grid.clearDynamicObstacles();
+          for (const p of stageState.pistons) {
+            p.y = p.baseY + Math.sin(stageState.phase * p.freq + p.offset) * p.amp;
+            grid.stampDynamicObstacle(p.x, p.y, p.r, 1, 0);
+          }
+
+          grid.decayCongestion(0.75);
+          for (const fp of stageState.fluxParticles) {
+            fp.y += fp.vy * dt;
+            if (fp.y > 29) fp.y = 2;
+            if (fp.y < 2) fp.y = 29;
+            grid.addAgentFlux(fp.x, fp.y, fp.vx, fp.vy, 3.2, 0);
+          }
+
+          // If a piston overlaps the agent, push agent to nearest walkable cell
+          if (!grid.isWalkable(agent.x | 0, agent.y | 0, 1, null, 0)) {
+            const safeIdx = grid.findNearestWalkable(agent.x, agent.y, 8, 1, null, 0);
+            if (safeIdx >= 0) {
+              agent.x = (safeIdx % grid.width) + 0.5;
+              agent.y = ((safeIdx / grid.width) | 0) + 0.5;
+            }
+          }
+          rebuildStageField();
+        }
+      },
+
+      {
+        name: 'Stage 7: 2.5D Multi-Layer Overpass & Stair Portals',
+        desc: 'Layer 0 (ground) is completely severed by an impassable canyon wall. The agent ascends a vertical stair portal (addStairPortal) to Layer 1 (upper bridge deck), crosses over the canyon, and descends back to Layer 0.',
+        features: [
+          'new GridWorld(cx, cy, null, { layers: 2 })',
+          'grid.addStairPortal(x, y, w, h, fromLayer, toLayer)',
+          'detectPortals(grid) across 2.5D layers'
+        ],
+        setup() {
+          grid = new GridWorld(CX, CY, null, { layers: 2 });
+
+          // Layer 0: Ground floor bisected by an impassable canyon wall at x=22..25
+          grid.setRect(0, 0, 48, 1, COST_BLOCK, 0);
+          grid.setRect(0, 31, 48, 1, COST_BLOCK, 0);
+          grid.setRect(0, 0, 1, 32, COST_BLOCK, 0);
+          grid.setRect(47, 0, 1, 32, COST_BLOCK, 0);
+          grid.setRect(22, 1, 4, 30, COST_BLOCK, 0);
+
+          // Layer 1: Mostly impassable void EXCEPT an elevated overpass bridge spanning x=12..36, y=12..20
+          grid.setRect(0, 0, 48, 32, COST_BLOCK, 1);
+          grid.setRect(12, 12, 24, 8, COST_OPEN, 1);
+
+          // Register ascending/descending vertical stair portals between Layer 0 and Layer 1
+          grid.addStairPortal(13, 15, 2, 2, 0, 1, { cost: 2 });
+          grid.addStairPortal(33, 15, 2, 2, 1, 0, { cost: 2 });
+
+          Object.assign(agent, { x: 5.5, y: 16.0, z: 0, vx: 0, vy: 0, profile: null, minClearance: 1, footprint: null, trail: [] });
+          goal = { x: 42.5, y: 16.0, z: 0 };
+        },
+        update(dt) {}
+      }
+    ];
+
+    function rebuildStageField() {
+      portals = detectPortals(grid, agent.minClearance, MAX_PORTAL_LEN, agent.profile, agent.footprint);
+      field = solveFlowField(grid, goal.x, goal.y, goal.z, agent.minClearance, agent.profile, agent.footprint);
+    }
+
+    function loadStage(idx) {
+      currentStageIdx = (idx + STAGES.length) % STAGES.length;
+      stageTime = 0;
+      stageState = {};
+      const st = STAGES[currentStageIdx];
+      st.setup();
+      rebuildStageField();
+      updateStageUI();
+    }
+
+    // -------------------------------------------------------------------------
+    // Single-Agent Physics & Flow-Field Steering Step
+    // -------------------------------------------------------------------------
+    function stepAgent(dt) {
+      const W = grid.width, H = grid.height, LC = grid.layerCells;
+      const cellX = clamp(Math.floor(agent.x), 0, W - 1);
+      const cellY = clamp(Math.floor(agent.y), 0, H - 1);
+      const cellIdx = grid.index(cellX, cellY, agent.z);
+
+      // Check vertical portal transition (#H3)
+      const nextZ = field.portalNextZ[cellIdx];
+      if (nextZ >= 0 && nextZ !== agent.z) {
+        agent.z = nextZ;
+      }
+
+      // Line-of-Sight raycast check (#E1) when on the same layer as the goal
+      let dirX = 0, dirY = 0;
+      const distToGoal = Math.hypot(goal.x - agent.x, goal.y - agent.y);
+      if (agent.z === goal.z && distToGoal < 14) {
+        const ray = grid.raycast(agent.x, agent.y, goal.x, goal.y, {
+          layer: agent.z,
+          minClearance: agent.minClearance,
+          profile: agent.profile,
+          maxCost: 12
+        });
+        if (!ray.hit && distToGoal > 1e-4) {
+          dirX = (goal.x - agent.x) / distToGoal;
+          dirY = (goal.y - agent.y) / distToGoal;
+        }
+      }
+
+      // Otherwise sample the solved flow field
+      if (dirX === 0 && dirY === 0) {
+        dirX = field.flowX[cellIdx];
+        dirY = field.flowY[cellIdx];
+
+        // Fallback if standing on a zero-vector border cell: aim toward lowest-integration neighbor
+        if (dirX === 0 && dirY === 0) {
+          let bestIdx = -1, bestD = field.integration[cellIdx];
+          const zOff = agent.z * LC;
+          for (let d = 0; d < 8; d++) {
+            const nx = cellX + DX[d], ny = cellY + DY[d];
+            if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+            const nIdx = zOff + ny * W + nx;
+            if (field.integration[nIdx] < bestD) {
+              bestD = field.integration[nIdx];
+              bestIdx = nIdx;
+            }
+          }
+          if (bestIdx >= 0) {
+            const tx = (bestIdx % LC) % W + 0.5;
+            const ty = (((bestIdx % LC) / W) | 0) + 0.5;
+            const l = Math.hypot(tx - agent.x, ty - agent.y) || 1;
+            dirX = (tx - agent.x) / l;
+            dirY = (ty - agent.y) / l;
+          }
+        }
+      }
+
+      // Smooth steering inertia
+      const blend = Math.min(1, dt * 10);
+      agent.vx += (dirX * agent.speed - agent.vx) * blend;
+      agent.vy += (dirY * agent.speed - agent.vy) * blend;
+
+      const tryX = agent.x + agent.vx * dt;
+      const tryY = agent.y + agent.vy * dt;
+
+      const canXY = grid.isWalkable(Math.floor(tryX), Math.floor(tryY), agent.minClearance, agent.profile, agent.z, agent.footprint);
+      if (canXY) {
+        agent.x = tryX;
+        agent.y = tryY;
+      } else {
+        const canX = grid.isWalkable(Math.floor(tryX), Math.floor(agent.y), agent.minClearance, agent.profile, agent.z, agent.footprint);
+        const canY = grid.isWalkable(Math.floor(agent.x), Math.floor(tryY), agent.minClearance, agent.profile, agent.z, agent.footprint);
+        if (canX) {
+          agent.x = tryX;
+          agent.vy *= 0.2;
+        } else if (canY) {
+          agent.y = tryY;
+          agent.vx *= 0.2;
+        } else {
+          // Nudge toward cell center to prevent corner snagging
+          agent.x += (cellX + 0.5 - agent.x) * 0.25;
+          agent.y += (cellY + 0.5 - agent.y) * 0.25;
+        }
+      }
+
+      agent.trail.push({ x: agent.x, y: agent.y, z: agent.z });
+      if (agent.trail.length > 180) agent.trail.shift();
+
+      // Goal arrival check
+      if (agent.z === goal.z && Math.hypot(agent.x - goal.x, agent.y - goal.y) < 0.85) {
+        if (currentStageIdx === 1 && !stageState.podPicked) return;
+        completedStages.add(currentStageIdx);
+        updateStageUI();
+        if (autoAdvance) {
+          loadStage(currentStageIdx + 1);
+        }
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Minimal Canvas Renderer
+    // -------------------------------------------------------------------------
+    function render() {
+      const W = grid.width, H = grid.height, LC = grid.layerCells;
+      const visMode = document.getElementById('visMode').value;
+      const z = agent.z;
+      const zOff = z * LC;
+
+      ctx.fillStyle = '#0d0d0d';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // 1. Render grid cells on active layer (and ghostly preview of Layer 1 in Stage 7)
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const idx = zOff + y * W + x;
+          const px = x * CELL_PX, py = y * CELL_PX;
+          const baseCost = grid.costs[idx];
+
+          if (baseCost >= COST_BLOCK) {
+            ctx.fillStyle = '#343a40';
+            ctx.fillRect(px, py, CELL_PX, CELL_PX);
+            continue;
+          }
+
+          // Terrain visualization (Stage 2)
+          if (grid.terrainIds) {
+            const tid = grid.terrainIds[idx];
+            if (tid === 1) ctx.fillStyle = '#3b2f20'; // Mud
+            else if (tid === 2) ctx.fillStyle = '#113a5c'; // Deep water
+            else if (tid === 3) ctx.fillStyle = '#495057'; // Causeway
+            else ctx.fillStyle = '#141414';
+          } else {
+            ctx.fillStyle = z === 1 ? '#1e162b' : '#141414';
+          }
+          ctx.fillRect(px, py, CELL_PX, CELL_PX);
+
+          // Visualization overlays
+          if (visMode === 'integration') {
+            const d = field.integration[idx];
+            if (Number.isFinite(d)) {
+              const t = clamp(d / 65, 0, 1);
+              ctx.fillStyle = `hsla(${(1 - t) * 210}, 75%, 40%, 0.45)`;
+              ctx.fillRect(px, py, CELL_PX, CELL_PX);
+            }
+          } else if (visMode === 'clearance' && grid.clearance) {
+            const c = grid.clearance[idx];
+            const t = clamp(c / 6, 0, 1);
+            ctx.fillStyle = `rgba(56, 217, 169, ${t * 0.45})`;
+            ctx.fillRect(px, py, CELL_PX, CELL_PX);
+          } else if (visMode === 'sdf' && grid.wallDist) {
+            const wd = grid.wallDist[idx];
+            const t = clamp(1 - wd / grid.wallPenaltyRadius, 0, 1);
+            if (t > 0) {
+              ctx.fillStyle = `rgba(255, 146, 43, ${t * 0.5})`;
+              ctx.fillRect(px, py, CELL_PX, CELL_PX);
+            }
+          }
+
+          // Tactical threat overlay (Stage 5)
+          if (grid.hasTactical && grid.tacticalCosts[idx] > 0) {
+            const a = clamp(grid.tacticalCosts[idx] / 45, 0.08, 0.65);
+            ctx.fillStyle = `rgba(224, 49, 49, ${a})`;
+            ctx.fillRect(px, py, CELL_PX, CELL_PX);
+          }
+
+          // Dynamic obstacle stamp (Stage 6)
+          if (grid.hasDynamicObstacles && grid.dynamicObstacles[idx]) {
+            ctx.fillStyle = '#c92a2a';
+            ctx.fillRect(px, py, CELL_PX, CELL_PX);
+          }
+
+          // Continuum crowd congestion (Stage 6)
+          if (grid.hasCongestion && grid.congestion[idx] > 0.05) {
+            const a = clamp(grid.congestion[idx] / 4, 0.1, 0.55);
+            ctx.fillStyle = `rgba(240, 140, 0, ${a})`;
+            ctx.fillRect(px, py, CELL_PX, CELL_PX);
+          }
+        }
+      }
+
+      // In Stage 7 (2.5D multi-layer), outline the Layer 1 bridge deck when viewing Layer 0
+      if (grid.layers > 1) {
+        ctx.strokeStyle = 'rgba(174, 62, 201, 0.7)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(12 * CELL_PX, 12 * CELL_PX, 24 * CELL_PX, 8 * CELL_PX);
+        for (const vp of grid.verticalPortals) {
+          const ax = (vp.anchorX - 1) * CELL_PX, ay = (vp.anchorY - 1) * CELL_PX;
+          ctx.fillStyle = 'rgba(174, 62, 201, 0.55)';
+          ctx.fillRect(ax, ay, 2 * CELL_PX, 2 * CELL_PX);
+          ctx.fillStyle = '#fff';
+          ctx.fillText('STAIR', ax + 2, ay + 12);
+        }
+      }
+
+      // 2. Render Flow Vectors / Currents / SDF Gradients
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+      ctx.lineWidth = 1;
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const idx = zOff + y * W + x;
+          if (field.cellBlocked[idx]) continue;
+          const cx = (x + 0.5) * CELL_PX, cy = (y + 0.5) * CELL_PX;
+
+          // Anisotropic currents indicator
+          if (grid.hasAnisotropy && grid.currentX) {
+            const vx = grid.currentX[idx], vy = grid.currentY[idx];
+            if (Math.hypot(vx, vy) > 0.2) {
+              ctx.strokeStyle = 'rgba(77, 171, 247, 0.35)';
+              ctx.beginPath();
+              ctx.moveTo(cx, cy);
+              ctx.lineTo(cx + vx * 5, cy + vy * 5);
+              ctx.stroke();
+            }
+          }
+
+          if (visMode === 'flow' || visMode === 'integration') {
+            const fx = field.flowX[idx], fy = field.flowY[idx];
+            if (fx !== 0 || fy !== 0) {
+              ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+              ctx.beginPath();
+              ctx.moveTo(cx, cy);
+              ctx.lineTo(cx + fx * 5.5, cy + fy * 5.5);
+              ctx.stroke();
+            }
+          }
+        }
+      }
+
+      // 3. Render Chunk Grid & Detected Portals when selected
+      if (visMode === 'portals') {
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+        for (let x = CS; x < W; x += CS) {
+          ctx.beginPath(); ctx.moveTo(x * CELL_PX, 0); ctx.lineTo(x * CELL_PX, H * CELL_PX); ctx.stroke();
+        }
+        for (let y = CS; y < H; y += CS) {
+          ctx.beginPath(); ctx.moveTo(0, y * CELL_PX); ctx.lineTo(W * CELL_PX, y * CELL_PX); ctx.stroke();
+        }
+        ctx.fillStyle = '#4dabf7';
+        for (const p of portals) {
+          ctx.beginPath();
+          ctx.arc(p.anchorX * CELL_PX, p.anchorY * CELL_PX, 3.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      // 4. Render Stage-Specific Props (Equipment Pod in Stage 2)
+      if (currentStageIdx === 1 && !stageState.podPicked) {
+        ctx.fillStyle = '#3bc9db';
+        ctx.beginPath();
+        ctx.arc(stageState.pod.x * CELL_PX, stageState.pod.y * CELL_PX, 6, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 5. Render Goal Beacon
+      ctx.fillStyle = '#fcc419';
+      ctx.beginPath();
+      ctx.arc(goal.x * CELL_PX, goal.y * CELL_PX, 6.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 6. Render Agent Trail, LOS Ray & Agent Body
+      if (agent.trail.length > 1) {
+        ctx.strokeStyle = '#52b788';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let i = 0; i < agent.trail.length; i++) {
+          const pt = agent.trail[i];
+          if (i === 0) ctx.moveTo(pt.x * CELL_PX, pt.y * CELL_PX);
+          else ctx.lineTo(pt.x * CELL_PX, pt.y * CELL_PX);
+        }
+        ctx.stroke();
+      }
+
+      const ray = grid.raycast(agent.x, agent.y, goal.x, goal.y, {
+        layer: agent.z,
+        minClearance: agent.minClearance,
+        profile: agent.profile
+      });
+      ctx.strokeStyle = ray.hit ? 'rgba(255, 107, 107, 0.35)' : 'rgba(81, 207, 102, 0.65)';
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(agent.x * CELL_PX, agent.y * CELL_PX);
+      ctx.lineTo(ray.x * CELL_PX, ray.y * CELL_PX);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Draw Agent-01 (and rectangular vehicle footprint in Stage 3)
+      const ax = agent.x * CELL_PX, ay = agent.y * CELL_PX;
+      if (agent.footprint) {
+        ctx.strokeStyle = '#96f2d7';
+        ctx.lineWidth = 1.5;
+        const fw = agent.footprint.width * CELL_PX * 0.7;
+        const fl = agent.footprint.length * CELL_PX * 0.7;
+        ctx.strokeRect(ax - fw * 0.5, ay - fl * 0.5, fw, fl);
+      }
+      ctx.fillStyle = '#52b788';
+      ctx.beginPath();
+      ctx.arc(ax, ay, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // Update telemetry panel
+      const cIdx = grid.index(clamp(agent.x | 0, 0, W - 1), clamp(agent.y | 0, 0, H - 1), agent.z);
+      const distVal = field.integration[cIdx];
+      document.getElementById('telPos').textContent = `(${agent.x.toFixed(1)}, ${agent.y.toFixed(1)}, L${agent.z})`;
+      document.getElementById('telVel').textContent = `(${agent.vx.toFixed(1)}, ${agent.vy.toFixed(1)})`;
+      document.getElementById('telProf').textContent = `${agent.profile || 'default'} / clr:${agent.minClearance}`;
+      document.getElementById('telDist').textContent = Number.isFinite(distVal) ? distVal.toFixed(2) : '∞';
+      document.getElementById('telRay').textContent = ray.hit ? `Blocked @ ${ray.distance.toFixed(1)}m` : `Clear (${ray.distance.toFixed(1)}m)`;
+      document.getElementById('telPortals').textContent = `${portals.length} active`;
+      document.getElementById('telTime').textContent = `${stageTime.toFixed(1)}s`;
+    }
+
+    // -------------------------------------------------------------------------
+    // UI Controls & Main Animation Loop
+    // -------------------------------------------------------------------------
+    function updateStageUI() {
+      const st = STAGES[currentStageIdx];
+      document.getElementById('stageHeader').textContent = `[${currentStageIdx + 1}/${STAGES.length}] ${st.name}`;
+      document.getElementById('stageDesc').textContent = st.desc;
+
+      const ul = document.getElementById('stageFeatures');
+      ul.innerHTML = '';
+      for (const feat of st.features) {
+        const li = document.createElement('li');
+        li.textContent = feat;
+        ul.appendChild(li);
+      }
+
+      const pills = document.getElementById('stagePills');
+      pills.innerHTML = '';
+      STAGES.forEach((s, i) => {
+        const b = document.createElement('span');
+        b.className = 'stage-pill' + (i === currentStageIdx ? ' current' : '') + (completedStages.has(i) ? ' done' : '');
+        b.textContent = `S${i + 1}`;
+        b.onclick = () => loadStage(i);
+        pills.appendChild(b);
+      });
+    }
+
+    document.getElementById('btnPrev').onclick = () => loadStage(currentStageIdx - 1);
+    document.getElementById('btnNext').onclick = () => loadStage(currentStageIdx + 1);
+    document.getElementById('btnReset').onclick = () => loadStage(currentStageIdx);
+    document.getElementById('btnPause').onclick = (e) => {
+      paused = !paused;
+      e.target.textContent = paused ? 'Resume' : 'Pause';
+      e.target.classList.toggle('active', paused);
+    };
+    document.getElementById('btnAuto').onclick = (e) => {
+      autoAdvance = !autoAdvance;
+      e.target.textContent = `Auto-Advance: ${autoAdvance ? 'ON' : 'OFF'}`;
+      e.target.classList.toggle('active', autoAdvance);
+    };
+
+    // Click on canvas to move goal inside the current stage
+    canvas.addEventListener('click', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const gx = ((e.clientX - rect.left) / rect.width) * grid.width;
+      const gy = ((e.clientY - rect.top) / rect.height) * grid.height;
+      if (grid.isWalkable(gx | 0, gy | 0, agent.minClearance, agent.profile, goal.z, agent.footprint)) {
+        goal.x = gx;
+        goal.y = gy;
+        rebuildStageField();
+      }
+    });
+
+    loadStage(0);
+
+    let lastTime = performance.now();
+    function loop(now) {
+      const dt = Math.min(0.05, (now - lastTime) / 1000);
+      lastTime = now;
+      if (!paused) {
+        stageTime += dt;
+        STAGES[currentStageIdx].update(dt);
+        stepAgent(dt);
+      }
+      render();
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
