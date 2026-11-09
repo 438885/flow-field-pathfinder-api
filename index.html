@@ -4268,7 +4268,7 @@ if (currentStageIdx === 37) {
         );
       }
 
-if (currentStageIdx === 40 && stageState.phaseLabel) {
+      if (currentStageIdx === 40 && stageState.phaseLabel) {
         // Layer 0 Overlays: Omni-Suit Pod, Blast-Door Terminal, Dirty Clusters, Unstamped Gate, Mines, Crowd & Jump Pad
         if (z === 0) {
           if (!stageState.podPicked) {
@@ -4484,96 +4484,6 @@ if (currentStageIdx === 40 && stageState.phaseLabel) {
       document.getElementById('telPos').textContent = `(${agent.x.toFixed(1)}, ${agent.y.toFixed(1)}, L${agent.z})`;
       document.getElementById('telVel').textContent = `(${agent.vx.toFixed(1)}, ${agent.vy.toFixed(1)}) [${simSpeed}×]`;
       document.getElementById('telProf').textContent = `${profDisplay} / clr:${agent.minClearance}`;
-      document.getElementById('telDist').textContent = Number.isFinite(distVal) ? distVal.toFixed(2) : '∞';
-      document.getElementById('telRay').textContent = ray.hit ? `Blocked @ ${ray.distance.toFixed(1)}m` : `Clear (${ray.distance.toFixed(1)}m)`;
-      document.getElementById('telPortals').textContent = `${portals.length} active`;
-      document.getElementById('telTime').textContent = `${stageTime.toFixed(1)}s`;
-    }
-
-      // 5. Render Goal Target Reticle (Crisp Technical Crosshair + Ring)
-      const gx = goal.x * CELL_PX, gy = goal.y * CELL_PX;
-      ctx.strokeStyle = '#e3b341';
-      ctx.lineWidth = 1.8;
-      ctx.beginPath();
-      ctx.arc(gx, gy, 7, 0, Math.PI * 2);
-      ctx.moveTo(gx - 10, gy); ctx.lineTo(gx + 10, gy);
-      ctx.moveTo(gx, gy - 10); ctx.lineTo(gx, gy + 10);
-      ctx.stroke();
-      ctx.fillStyle = '#e3b341';
-      ctx.beginPath();
-      ctx.arc(gx, gy, 2.5, 0, Math.PI * 2);
-      ctx.fill();
-
-      // 6. Render Agent Trail, LOS Ray & Oriented Technical Agent Marker
-      const ray = grid.raycast(agent.x, agent.y, goal.x, goal.y, {
-        layer: agent.z,
-        minClearance: agent.minClearance,
-        profile: agent.profile
-      });
-
-      if (showLos) {
-        if (agent.trail.length > 1) {
-          ctx.strokeStyle = 'rgba(63, 185, 80, 0.75)';
-          ctx.lineWidth = 1.8;
-          ctx.beginPath();
-          for (let i = 0; i < agent.trail.length; i++) {
-            const pt = agent.trail[i];
-            if (i === 0) ctx.moveTo(pt.x * CELL_PX, pt.y * CELL_PX);
-            else ctx.lineTo(pt.x * CELL_PX, pt.y * CELL_PX);
-          }
-          ctx.stroke();
-        }
-
-        ctx.strokeStyle = ray.hit ? 'rgba(248, 81, 73, 0.45)' : 'rgba(63, 185, 80, 0.7)';
-        ctx.lineWidth = 1.2;
-        ctx.setLineDash([4, 4]);
-        ctx.beginPath();
-        ctx.moveTo(agent.x * CELL_PX, agent.y * CELL_PX);
-        ctx.lineTo(ray.x * CELL_PX, ray.y * CELL_PX);
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-
-      // Draw Agent-01 with directional heading chevron & optional rectangular vehicle footprint
-      const ax = agent.x * CELL_PX, ay = agent.y * CELL_PX;
-      if (Math.hypot(agent.vx, agent.vy) > 0.25) {
-        agent.heading = Math.atan2(agent.vy, agent.vx);
-      }
-
-      if (agent.footprint) {
-        ctx.strokeStyle = '#7ee787';
-        ctx.lineWidth = 1.4;
-        const fw = agent.footprint.width * CELL_PX * 0.72;
-        const fl = agent.footprint.length * CELL_PX * 0.72;
-        ctx.strokeRect(ax - fw * 0.5, ay - fl * 0.5, fw, fl);
-      }
-
-      ctx.save();
-      ctx.translate(ax, ay);
-      ctx.rotate(agent.heading || 0);
-      ctx.fillStyle = '#2ea043';
-      ctx.strokeStyle = '#f0f6fc';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.arc(0, 0, 6.2, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.moveTo(5.2, 0);
-      ctx.lineTo(-2.5, -3.2);
-      ctx.lineTo(-1.2, 0);
-      ctx.lineTo(-2.5, 3.2);
-      ctx.closePath();
-      ctx.fill();
-      ctx.restore();
-
-      // Update telemetry panel
-      const cIdx = grid.index(clamp(agent.x | 0, 0, W - 1), clamp(agent.y | 0, 0, H - 1), agent.z);
-      const distVal = field.integration[cIdx];
-      document.getElementById('telPos').textContent = `(${agent.x.toFixed(1)}, ${agent.y.toFixed(1)}, L${agent.z})`;
-      document.getElementById('telVel').textContent = `(${agent.vx.toFixed(1)}, ${agent.vy.toFixed(1)}) [${simSpeed}×]`;
-      document.getElementById('telProf').textContent = `${agent.profile || 'default'} / clr:${agent.minClearance}`;
       document.getElementById('telDist').textContent = Number.isFinite(distVal) ? distVal.toFixed(2) : '∞';
       document.getElementById('telRay').textContent = ray.hit ? `Blocked @ ${ray.distance.toFixed(1)}m` : `Clear (${ray.distance.toFixed(1)}m)`;
       document.getElementById('telPortals').textContent = `${portals.length} active`;
