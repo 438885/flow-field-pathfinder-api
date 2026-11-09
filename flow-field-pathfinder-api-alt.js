@@ -1,11 +1,12 @@
-// flow-field-pathfinder-api-alt.js
-
-//#region 1: Constants & Math Utilities
+//#region 1: Grid & Cost Constants
 /** @constant {number} Chunk width/height in cells (16x16) */
 export const CS = 16;
 
 /** @constant {number} Total cells per chunk (256) */
 export const CC = CS * CS;
+
+/** @constant {number} Super-chunk width/height in chunks (4x4 chunks = 64x64 cells) (#I4) */
+export const SUPER_STEP = 4;
 
 /** @constant {number} Default open terrain traversal cost */
 export const COST_OPEN = 2;
@@ -18,7 +19,9 @@ export const MAX_PORTAL_LEN = 6;
 
 /** @constant {number} Maximum tracked brushfire clearance radius in cells (#B2) */
 export const MAX_CLEARANCE = 16;
+//#endregion
 
+//#region 2: Directional Lookup Tables & Math Utilities
 const SQ2 = Math.SQRT2;
 const OCT = SQ2 - 1;
 
@@ -52,7 +55,7 @@ export const octile = (dx, dy) => {
 const hashMix = (h, v) => Math.imul((h ^ (v | 0)) >>> 0, 16777619) >>> 0;
 //#endregion
 
-//#region 2: 4-Ary Cache-Friendly Min-Heap (#B5)
+//#region 3: 4-Ary Cache-Friendly Min-Heap (#B5)
 /**
  * #B5: TypedArray-backed 4-ary min-heap for Eikonal, Dijkstra, and A* searches.
  * Halves tree depth and improves CPU cache-line locality during sift-down.
@@ -80,8 +83,7 @@ export class MinHeap {
     it[c] = item; k[c] = key;
   }
   pop() {
-    let { it, k } = this, top = it[0], li = --this.sz, item = k[li], key = k[li], p = 0, ch;
-    item = it[li];
+    let { it, k } = this, top = it[0], li = --this.sz, item = it[li], key = k[li], p = 0, ch;
     this.lastKey = k[0];
     while ((ch = (p << 2) + 1) < li) {
       let mc = ch, mk = k[ch];
@@ -98,7 +100,7 @@ export class MinHeap {
 }
 //#endregion
 
-//#region 3: Zero-Allocation Slab Buffer Pool (#B4)
+//#region 4: Zero-Allocation Slab Buffer Pool (#B4)
 /**
  * #B4: Zero-allocation slab pool for recycling chunk-sized TypedArrays on cache eviction.
  */
@@ -129,22 +131,35 @@ export class FieldBufferPool {
 }
 //#endregion
 
-//#region 4: GridWorld Core & Dirty State Tracking (#B1)
 /**
- * 2D chunked cost grid supporting static costs, two-tier dirty tracking (#B1),
- * localized dirty-halo SDF & clearance updates (#B2), tactical FOV shadowcasting (#E1),
- * anisotropic velocity-flux congestion (#C1), dynamic obstacle stamps (#C3),
- * and terrain ID movement profiles (#D4).
+ * 2D / 2.5D Multi-Floor chunked cost grid supporting:
+ * - #H3: Stacked vertical layers (bridges, overpasses, multi-story buildings) & stair/ramp portals
+ * - #H4: Anisotropic directional clearance (`clearanceX`, `clearanceY`) for rectangular vehicles
+ * - #I3: `SharedArrayBuffer` backing (`opts.shared`) for lock-free Web Worker pipelines
+ * - #B1, #B2, #F3: Two-tier dirty tracking & clustered multi-rect SDF/Clearance sweeps
  */
 export class GridWorld {
-  constructor(cx, cy, existingCosts = null) {
+  //#region 5: GridWorld Core State & SharedArrayBuffer Hydration (#H3, #H4, #I3)
+  constructor(cx, cy, existingCosts = null, opts = {}) {
     this.cx = cx;
     this.cy = cy;
+    this.layers = Math.max(1, opts.layers ?? 1);
     this.width = cx * CS;
     this.height = cy * CS;
-    this.chunkCount = cx * cy;
-    const len = this.width * this.height;
-    this.costs = existingCosts ? existingCosts.subarray(0, len) : new Uint8Array(len).fill(COST_OPEN);
+    this.layerChunks = cx * cy;
+    this.layerCells = this.width * this.height;
+    this.chunkCount = this.layerChunks * this.layers;
+    const len = this.layerCells * this.layers;
+
+    // #I3: Optional SharedArrayBuffer backing for lock-free Worker concurrency
+    this.useSharedMemory = !!(opts.shared && typeof SharedArrayBuffer !== 'undefined');
+    this._allocBuf = (ByteSize) => this.useSharedMemory ? new SharedArrayBuffer(ByteSize) : new ArrayBuffer(ByteSize);
+
+    if (existingCosts) {
+      this.costs = existingCosts.subarray(0, len);
+    } else {
+      this.costs = new Uint8Array(this._allocBuf(len)).fill(COST_OPEN);
+    }
 
     // #B1: Two-Tier Dirty Tracking (Topology vs. Weights)
     this.dirtyChunks = new Set();
@@ -155,7 +170,7 @@ export class GridWorld {
     this.useEikonal = true;
     this.losSmoothing = true;
 
-    // #4 & #B2: Wall Repulsion / Signed Distance Field (SDF) with Dirty-Halo Bounds
+    // #4, #B2 & #F3: Wall Repulsion / Signed Distance Field (SDF)
     this.wallPenaltyRadius = 2.5;
     this.wallPenaltyWeight = 0.0;
     this.wallRepulsionWeight = 0.0;
@@ -164,13 +179,15 @@ export class GridWorld {
     this.wallGradY = null;
     this._sdfDirty = true;
     this._sdfFullDirty = true;
-    this._sdfRect = { x0: len, y0: len, x1: -1, y1: -1 };
+    this._sdfDirtyChunks = new Set();
 
-    // #5 & #B2: Clearance-Annotated Routing with Dirty-Halo Bounds
+    // #5, #B2, #F3 & #H4: Isotropic & Directional Clearance (X/Y Corridor Spans)
     this.clearance = null;
+    this.clearanceX = null;
+    this.clearanceY = null;
     this._clearanceDirty = true;
     this._clearanceFullDirty = true;
-    this._clearanceRect = { x0: len, y0: len, x1: -1, y1: -1 };
+    this._clearanceDirtyChunks = new Set();
 
     // #6 & #E1: Tactical / Threat-Modulated Overlay
     this.tacticalCosts = null;
@@ -196,46 +213,113 @@ export class GridWorld {
     this.dynamicObstacles = null;
     this.hasDynamicObstacles = false;
 
-    // #D4: Terrain ID Layer & Unit Movement Cost Profiles
+    // #D4 & #F1: Terrain ID Layer & Scoped Unit Movement Cost Profiles
     this.terrainIds = null;
     this.profiles = new Map();
+    this.profileIds = new Map();
+    this._nextProfileId = 1;
+
+    // #H3: Multi-Floor Vertical Stair / Ramp / Overpass Portal Definitions
+    this.verticalPortals = [];
   }
 
-  index(x, y) { return y * this.width + x; }
-  inBounds(x, y) { return x >= 0 && y >= 0 && x < this.width && y < this.height; }
+  /** #I3: Exports SharedArrayBuffer/ArrayBuffer views for hydrating a Worker thread */
+  toSharedDescriptor() {
+    return {
+      cx: this.cx, cy: this.cy, layers: this.layers,
+      useEikonal: this.useEikonal, losSmoothing: this.losSmoothing,
+      wallPenaltyRadius: this.wallPenaltyRadius, wallPenaltyWeight: this.wallPenaltyWeight, wallRepulsionWeight: this.wallRepulsionWeight,
+      congestionWeight: this.congestionWeight, congestionLaneWeight: this.congestionLaneWeight,
+      currentStrength: this.currentStrength,
+      costs: this.costs,
+      clearance: this.clearance, clearanceX: this.clearanceX, clearanceY: this.clearanceY,
+      wallDist: this.wallDist, wallGradX: this.wallGradX, wallGradY: this.wallGradY,
+      tacticalCosts: this.tacticalCosts, hasTactical: this.hasTactical,
+      congestion: this.congestion, congestionFluxX: this.congestionFluxX, congestionFluxY: this.congestionFluxY,
+      hasCongestion: this.hasCongestion, hasCongestionFlux: this.hasCongestionFlux,
+      dirMask: this.dirMask, currentX: this.currentX, currentY: this.currentY, hasAnisotropy: this.hasAnisotropy,
+      dynamicObstacles: this.dynamicObstacles, hasDynamicObstacles: this.hasDynamicObstacles,
+      terrainIds: this.terrainIds,
+      profiles: Array.from(this.profiles.entries()),
+      verticalPortals: this.verticalPortals
+    };
+  }
 
-  /** #D4: Resolves a profile's Uint8Array(256) cost lookup table if registered */
+  /** #I3: Hydrates a `GridWorld` instance directly over shared buffers in a Worker */
+  static fromSharedDescriptor(desc) {
+    const g = new GridWorld(desc.cx, desc.cy, desc.costs, { layers: desc.layers, shared: true });
+    g.useEikonal = desc.useEikonal; g.losSmoothing = desc.losSmoothing;
+    g.wallPenaltyRadius = desc.wallPenaltyRadius; g.wallPenaltyWeight = desc.wallPenaltyWeight; g.wallRepulsionWeight = desc.wallRepulsionWeight;
+    g.congestionWeight = desc.congestionWeight; g.congestionLaneWeight = desc.congestionLaneWeight;
+    g.currentStrength = desc.currentStrength;
+    if (desc.clearance) { g.clearance = desc.clearance; g.clearanceX = desc.clearanceX; g.clearanceY = desc.clearanceY; g._clearanceDirty = g._clearanceFullDirty = false; }
+    if (desc.wallDist) { g.wallDist = desc.wallDist; g.wallGradX = desc.wallGradX; g.wallGradY = desc.wallGradY; g._sdfDirty = g._sdfFullDirty = false; }
+    if (desc.tacticalCosts) { g.tacticalCosts = desc.tacticalCosts; g.hasTactical = desc.hasTactical; }
+    if (desc.congestion) { g.congestion = desc.congestion; g.congestionFluxX = desc.congestionFluxX; g.congestionFluxY = desc.congestionFluxY; g.hasCongestion = desc.hasCongestion; g.hasCongestionFlux = desc.hasCongestionFlux; }
+    if (desc.dirMask) { g.dirMask = desc.dirMask; g.currentX = desc.currentX; g.currentY = desc.currentY; g.hasAnisotropy = desc.hasAnisotropy; }
+    if (desc.dynamicObstacles) { g.dynamicObstacles = desc.dynamicObstacles; g.hasDynamicObstacles = desc.hasDynamicObstacles; }
+    if (desc.terrainIds) g.terrainIds = desc.terrainIds;
+    if (desc.profiles) { for (const [k, v] of desc.profiles) g.registerProfile(k, v); }
+    if (desc.verticalPortals) g.verticalPortals = desc.verticalPortals.slice();
+    return g;
+  }
+  //#endregion
+
+  //#region 6: GridWorld Indexing, Walkability & Two-Tier Dirty Tracking (#B1, #H4)
+  index(x, y, z = 0) { return z * this.layerCells + y * this.width + x; }
+  inBounds(x, y, z = 0) { return x >= 0 && y >= 0 && x < this.width && y < this.height && z >= 0 && z < this.layers; }
+
   getProfileTable(profile = null) {
     if (!profile) return null;
     return profile instanceof Uint8Array ? profile : (this.profiles.get(profile) || null);
   }
 
-  /** #D4: Returns base cell cost respecting terrain profiles and dynamic obstacles (#C3) */
+  getProfileId(profile = null) {
+    if (!profile) return 0;
+    let id = this.profileIds.get(profile);
+    if (id === undefined) {
+      id = this._nextProfileId++;
+      this.profileIds.set(profile, id);
+    }
+    return id;
+  }
+
   getEffectiveBaseCost(idx, profileTable = null) {
     if (this.hasDynamicObstacles && this.dynamicObstacles[idx]) return COST_BLOCK;
     if (profileTable && this.terrainIds) return profileTable[this.terrainIds[idx]];
     return this.costs[idx];
   }
 
-  isWalkable(x, y, minClearance = 1, profile = null) {
-    if (!this.inBounds(x, y)) return false;
-    const idx = this.index(x, y);
+  /**
+   * Checks walkability at `(x, y, z)`, supporting both isotropic `minClearance` and
+   * #H4 anisotropic rectangular vehicle footprints `{ width, length }`.
+   */
+  isWalkable(x, y, minClearance = 1, profile = null, z = 0, footprint = null) {
+    if (!this.inBounds(x, y, z)) return false;
+    const idx = this.index(x, y, z);
     const pTable = this.getProfileTable(profile);
     if (this.getEffectiveBaseCost(idx, pTable) >= COST_BLOCK) return false;
-    if (minClearance > 1) {
+    const reqClr = footprint ? Math.min(footprint.width ?? 1, footprint.length ?? 1) : minClearance;
+    const reqLong = footprint ? Math.max(footprint.width ?? 1, footprint.length ?? 1) : reqClr;
+    if (reqClr > 1 || reqLong > 1) {
       if (this._clearanceDirty || !this.clearance) this.updateClearance();
-      return this.clearance[idx] >= minClearance;
+      if (this.clearance[idx] < reqClr) return false;
+      if (reqLong > reqClr && Math.max(this.clearanceX[idx], this.clearanceY[idx]) < reqLong) return false;
     }
     return true;
   }
 
-  chunkIdAt(x, y) { return (y / CS | 0) * this.cx + (x / CS | 0); }
-  chunkOriginX(c) { return (c % this.cx) * CS; }
-  chunkOriginY(c) { return (c / this.cx | 0) * CS; }
-  localIndex(cell) { return ((cell / this.width | 0) % CS) * CS + (cell % this.width % CS); }
+  chunkIdAt(x, y, z = 0) { return z * this.layerChunks + (y / CS | 0) * this.cx + (x / CS | 0); }
+  chunkLayer(c) { return (c / this.layerChunks) | 0; }
+  chunkOriginX(c) { return ((c % this.layerChunks) % this.cx) * CS; }
+  chunkOriginY(c) { return (((c % this.layerChunks) / this.cx) | 0) * CS; }
+  localIndex(cell) {
+    const rem = cell % this.layerCells;
+    return ((rem / this.width | 0) % CS) * CS + (rem % this.width % CS);
+  }
 
-  _addChunkAndBorderNeighbors(set, x, y) {
-    const c = this.chunkIdAt(x, y);
+  _addChunkAndBorderNeighbors(set, x, y, z = 0) {
+    const c = this.chunkIdAt(x, y, z);
     set.add(c);
     const lx = x % CS, ly = y % CS;
     if (lx === 0 && x > 0) set.add(c - 1);
@@ -244,25 +328,17 @@ export class GridWorld {
     if (ly === CS - 1 && y < this.height - 1) set.add(c + this.cx);
   }
 
-  /**
-   * #B1 & #B2: Marks a cell dirty, distinguishing structural topology changes from weight-only changes.
-   */
-  markCellDirty(x, y, isTopology = true) {
-    this._addChunkAndBorderNeighbors(this.dirtyChunks, x, y);
+  markCellDirty(x, y, isTopology = true, z = 0) {
+    this._addChunkAndBorderNeighbors(this.dirtyChunks, x, y, z);
     if (isTopology) {
-      this._addChunkAndBorderNeighbors(this.topologyDirtyChunks, x, y);
+      this._addChunkAndBorderNeighbors(this.topologyDirtyChunks, x, y, z);
+      const c = this.chunkIdAt(x, y, z);
       this._sdfDirty = true;
       this._clearanceDirty = true;
-      if (x < this._sdfRect.x0) this._sdfRect.x0 = x;
-      if (x > this._sdfRect.x1) this._sdfRect.x1 = x;
-      if (y < this._sdfRect.y0) this._sdfRect.y0 = y;
-      if (y > this._sdfRect.y1) this._sdfRect.y1 = y;
-      if (x < this._clearanceRect.x0) this._clearanceRect.x0 = x;
-      if (x > this._clearanceRect.x1) this._clearanceRect.x1 = x;
-      if (y < this._clearanceRect.y0) this._clearanceRect.y0 = y;
-      if (y > this._clearanceRect.y1) this._clearanceRect.y1 = y;
+      this._sdfDirtyChunks.add(c);
+      this._clearanceDirtyChunks.add(c);
     } else {
-      this._addChunkAndBorderNeighbors(this.weightsDirtyChunks, x, y);
+      this._addChunkAndBorderNeighbors(this.weightsDirtyChunks, x, y, z);
     }
   }
 
@@ -270,35 +346,125 @@ export class GridWorld {
     this.dirtyChunks.add(c);
     this.weightsDirtyChunks.add(c);
   }
+  //#endregion
 
-  getCost(x, y) {
-    return this.inBounds(x | 0, y | 0) ? this.costs[(y | 0) * this.width + (x | 0)] : COST_BLOCK;
+  //#region 7: GridWorld Vertical Stair Portals & Dirty Cluster Merging (#F3, #H3)
+  /**
+   * #H3: Registers a vertical stair, ramp, or overpass portal connecting `(x, y)` on `fromLayer`
+   * to `(x, y)` (or `(toX, toY)`) on `toLayer`.
+   */
+  addStairPortal(x, y, w = 2, h = 2, fromLayer = 0, toLayer = 1, opts = {}) {
+    const toX = opts.toX ?? x, toY = opts.toY ?? y;
+    const cxA = clamp(x | 0, 0, this.width - 1), cyA = clamp(y | 0, 0, this.height - 1);
+    const cxB = clamp(toX | 0, 0, this.width - 1), cyB = clamp(toY | 0, 0, this.height - 1);
+    const zA = clamp(fromLayer | 0, 0, this.layers - 1), zB = clamp(toLayer | 0, 0, this.layers - 1);
+    if (zA === zB && cxA === cxB && cyA === cyB) return null;
+
+    const cA = this.chunkIdAt(cxA, cyA, zA), cB = this.chunkIdAt(cxB, cyB, zB);
+    const oxA = this.chunkOriginX(cA), oyA = this.chunkOriginY(cA);
+    const oxB = this.chunkOriginX(cB), oyB = this.chunkOriginY(cB);
+    const cellsA = [], cellsB = [];
+    const pw = Math.max(1, Math.min(CS, w | 0)), ph = Math.max(1, Math.min(CS, h | 0));
+
+    for (let dy = 0; dy < ph; dy++) {
+      for (let dx = 0; dx < pw; dx++) {
+        const ax = clamp(cxA + dx, oxA, oxA + CS - 1), ay = clamp(cyA + dy, oyA, oyA + CS - 1);
+        const bx = clamp(cxB + dx, oxB, oxB + CS - 1), by = clamp(cyB + dy, oyB, oyB + CS - 1);
+        cellsA.push(this.index(ax, ay, zA));
+        cellsB.push(this.index(bx, by, zB));
+      }
+    }
+
+    const vp = {
+      chunkA: cA, chunkB: cB,
+      layerA: zA, layerB: zB,
+      cellsA: new Int32Array(cellsA),
+      cellsB: new Int32Array(cellsB),
+      centerA: cellsA[cellsA.length >> 1],
+      centerB: cellsB[cellsB.length >> 1],
+      canAB: true,
+      canBA: opts.bidirectional !== false,
+      cost: opts.cost ?? COST_OPEN,
+      exitX: opts.exitX ?? 0,
+      exitY: opts.exitY ?? 0,
+      anchorX: cxA + pw * 0.5,
+      anchorY: cyA + ph * 0.5
+    };
+    this.verticalPortals.push(vp);
+    this.dirtyChunks.add(cA); this.dirtyChunks.add(cB);
+    this.topologyDirtyChunks.add(cA); this.topologyDirtyChunks.add(cB);
+    return vp;
   }
 
-  setCost(x, y, cost) {
-    const ix = x | 0, iy = y | 0;
-    if (!this.inBounds(ix, iy)) return false;
-    const idx = iy * this.width + ix, prev = this.costs[idx];
+  _buildDirtyClusters(dirtyChunkSet, halo, isFull, layer = 0) {
+    const { width: W, height: H } = this;
+    if (isFull || dirtyChunkSet.size === 0 || dirtyChunkSet.size > (this.chunkCount >> 1)) {
+      return [{ x0: 0, y0: 0, x1: W - 1, y1: H - 1 }];
+    }
+    const rects = [];
+    for (const c of dirtyChunkSet) {
+      if (this.chunkLayer(c) !== layer) continue;
+      const ox = this.chunkOriginX(c), oy = this.chunkOriginY(c);
+      rects.push({
+        x0: Math.max(0, ox - halo),
+        y0: Math.max(0, oy - halo),
+        x1: Math.min(W - 1, ox + CS - 1 + halo),
+        y1: Math.min(H - 1, oy + CS - 1 + halo)
+      });
+    }
+    let merged = true;
+    while (merged && rects.length > 1) {
+      merged = false;
+      for (let i = 0; i < rects.length; i++) {
+        const a = rects[i];
+        for (let j = i + 1; j < rects.length; j++) {
+          const b = rects[j];
+          if (a.x0 <= b.x1 + 2 && a.x1 + 2 >= b.x0 && a.y0 <= b.y1 + 2 && a.y1 + 2 >= b.y0) {
+            a.x0 = Math.min(a.x0, b.x0);
+            a.y0 = Math.min(a.y0, b.y0);
+            a.x1 = Math.max(a.x1, b.x1);
+            a.y1 = Math.max(a.y1, b.y1);
+            rects.splice(j, 1);
+            merged = true;
+            break;
+          }
+        }
+        if (merged) break;
+      }
+    }
+    return rects;
+  }
+  //#endregion
+
+  //#region 8: GridWorld Cost Mutators & Bulk Loaders
+  getCost(x, y, z = 0) {
+    return this.inBounds(x | 0, y | 0, z | 0) ? this.costs[this.index(x | 0, y | 0, z | 0)] : COST_BLOCK;
+  }
+
+  setCost(x, y, cost, z = 0) {
+    const ix = x | 0, iy = y | 0, iz = z | 0;
+    if (!this.inBounds(ix, iy, iz)) return false;
+    const idx = this.index(ix, iy, iz), prev = this.costs[idx];
     if (prev === cost) return false;
     this.costs[idx] = cost;
     const topoChanged = (prev >= COST_BLOCK) !== (cost >= COST_BLOCK);
-    this.markCellDirty(ix, iy, topoChanged);
+    this.markCellDirty(ix, iy, topoChanged, iz);
     return true;
   }
 
-  setRect(x, y, w, h, cost) {
+  setRect(x, y, w, h, cost, z = 0) {
     const x0 = clamp(Math.floor(x), 0, this.width), x1 = clamp(Math.ceil(x + w), 0, this.width);
     const y0 = clamp(Math.floor(y), 0, this.height), y1 = clamp(Math.ceil(y + h), 0, this.height);
     let changed = 0;
     for (let yy = y0; yy < y1; yy++) {
       for (let xx = x0; xx < x1; xx++) {
-        if (this.setCost(xx, yy, cost)) changed++;
+        if (this.setCost(xx, yy, cost, z)) changed++;
       }
     }
     return changed;
   }
 
-  setDisc(wx, wy, r, cost) {
+  setDisc(wx, wy, r, cost, z = 0) {
     const r2 = r * r;
     const x0 = clamp(Math.floor(wx - r), 0, this.width - 1), x1 = clamp(Math.ceil(wx + r), 0, this.width - 1);
     const y0 = clamp(Math.floor(wy - r), 0, this.height - 1), y1 = clamp(Math.ceil(wy + r), 0, this.height - 1);
@@ -306,19 +472,26 @@ export class GridWorld {
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
         if ((x + 0.5 - wx) ** 2 + (y + 0.5 - wy) ** 2 <= r2) {
-          if (this.setCost(x, y, cost)) changed++;
+          if (this.setCost(x, y, cost, z)) changed++;
         }
       }
     }
     return changed;
   }
 
-  loadCosts(srcCosts) {
-    const len = Math.min(this.costs.length, srcCosts.length);
-    for (let i = 0; i < len; i++) this.costs[i] = srcCosts[i];
-    for (let c = 0; c < this.chunkCount; c++) {
-      this.dirtyChunks.add(c);
-      this.topologyDirtyChunks.add(c);
+  loadCosts(srcCosts, layer = null) {
+    if (layer !== null) {
+      const off = layer * this.layerCells, len = Math.min(this.layerCells, srcCosts.length);
+      for (let i = 0; i < len; i++) this.costs[off + i] = srcCosts[i];
+      for (let c = layer * this.layerChunks; c < (layer + 1) * this.layerChunks; c++) {
+        this.dirtyChunks.add(c); this.topologyDirtyChunks.add(c);
+      }
+    } else {
+      const len = Math.min(this.costs.length, srcCosts.length);
+      for (let i = 0; i < len; i++) this.costs[i] = srcCosts[i];
+      for (let c = 0; c < this.chunkCount; c++) {
+        this.dirtyChunks.add(c); this.topologyDirtyChunks.add(c);
+      }
     }
     this._sdfDirty = this._sdfFullDirty = true;
     this._clearanceDirty = this._clearanceFullDirty = true;
@@ -332,7 +505,6 @@ export class GridWorld {
     return out;
   }
 
-  /** #B1: Consumes and categorizes dirty chunks into topology vs. weight-only sets */
   consumeDirtyState() {
     const topology = new Set(this.topologyDirtyChunks);
     const weights = new Set(this.weightsDirtyChunks);
@@ -342,11 +514,11 @@ export class GridWorld {
     this.weightsDirtyChunks.clear();
     return { topology, weights, all };
   }
-//#endregion
+  //#endregion
 
-//#region 5: Terrain ID Layer & Unit Cost Profiles (#D4)
+  //#region 9: GridWorld Terrain ID Layer & Unit Movement Profiles (#D4, #F1)
   ensureTerrainLayer() {
-    if (!this.terrainIds) this.terrainIds = new Uint8Array(this.width * this.height);
+    if (!this.terrainIds) this.terrainIds = new Uint8Array(this._allocBuf(this.layerCells * this.layers));
     return this.terrainIds;
   }
 
@@ -360,46 +532,48 @@ export class GridWorld {
       for (const [k, v] of Object.entries(costMapOrArray)) table[k | 0] = clamp(v | 0, 1, COST_BLOCK);
     }
     this.profiles.set(name, table);
+    if (!this.profileIds.has(name)) this.profileIds.set(name, this._nextProfileId++);
+    this.profileIds.set(table, this.profileIds.get(name));
     return table;
   }
 
-  setTerrain(x, y, terrainId) {
-    const ix = x | 0, iy = y | 0;
-    if (!this.inBounds(ix, iy)) return false;
-    const T = this.ensureTerrainLayer(), idx = iy * this.width + ix;
+  setTerrain(x, y, terrainId, z = 0) {
+    const ix = x | 0, iy = y | 0, iz = z | 0;
+    if (!this.inBounds(ix, iy, iz)) return false;
+    const T = this.ensureTerrainLayer(), idx = this.index(ix, iy, iz);
     if (T[idx] === terrainId) return false;
     T[idx] = terrainId;
-    this.markCellDirty(ix, iy, true);
+    this.markCellDirty(ix, iy, true, iz);
     return true;
   }
 
-  setRectTerrain(x, y, w, h, terrainId) {
+  setRectTerrain(x, y, w, h, terrainId, z = 0) {
     const x0 = clamp(Math.floor(x), 0, this.width), x1 = clamp(Math.ceil(x + w), 0, this.width);
     const y0 = clamp(Math.floor(y), 0, this.height), y1 = clamp(Math.ceil(y + h), 0, this.height);
     for (let yy = y0; yy < y1; yy++) {
-      for (let xx = x0; xx < x1; xx++) this.setTerrain(xx, yy, terrainId);
+      for (let xx = x0; xx < x1; xx++) this.setTerrain(xx, yy, terrainId, z);
     }
   }
-//#endregion
+  //#endregion
 
-//#region 6: Dynamic Moving Obstacle Stamp Layer (#C3)
+  //#region 10: GridWorld Dynamic Moving Obstacle Stamp Layer (#C3)
   ensureDynamicObstacleLayer() {
-    if (!this.dynamicObstacles) this.dynamicObstacles = new Uint8Array(this.width * this.height);
+    if (!this.dynamicObstacles) this.dynamicObstacles = new Uint8Array(this._allocBuf(this.layerCells * this.layers));
     return this.dynamicObstacles;
   }
 
-  stampDynamicObstacle(wx, wy, r = 0.8, blocked = 1) {
-    const D = this.ensureDynamicObstacleLayer(), r2 = r * r;
+  stampDynamicObstacle(wx, wy, r = 0.8, blocked = 1, z = 0) {
+    const D = this.ensureDynamicObstacleLayer(), r2 = r * r, iz = clamp(z | 0, 0, this.layers - 1);
     const x0 = clamp(Math.floor(wx - r), 0, this.width - 1), x1 = clamp(Math.ceil(wx + r), 0, this.width - 1);
     const y0 = clamp(Math.floor(wy - r), 0, this.height - 1), y1 = clamp(Math.ceil(wy + r), 0, this.height - 1);
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
         if ((x + 0.5 - wx) ** 2 + (y + 0.5 - wy) ** 2 <= r2) {
-          const idx = y * this.width + x;
+          const idx = this.index(x, y, iz);
           if (D[idx] !== blocked) {
             D[idx] = blocked;
-            this._addChunkAndBorderNeighbors(this.weightsDirtyChunks, x, y);
-            this._addChunkAndBorderNeighbors(this.dirtyChunks, x, y);
+            this._addChunkAndBorderNeighbors(this.weightsDirtyChunks, x, y, iz);
+            this._addChunkAndBorderNeighbors(this.dirtyChunks, x, y, iz);
           }
         }
       }
@@ -409,20 +583,21 @@ export class GridWorld {
 
   clearDynamicObstacles() {
     if (!this.dynamicObstacles || !this.hasDynamicObstacles) return;
-    const D = this.dynamicObstacles, W = this.width;
+    const D = this.dynamicObstacles, W = this.width, LC = this.layerCells;
     for (let i = 0; i < D.length; i++) {
       if (D[i]) {
         D[i] = 0;
-        const x = i % W, y = (i / W) | 0;
-        this._addChunkAndBorderNeighbors(this.weightsDirtyChunks, x, y);
-        this._addChunkAndBorderNeighbors(this.dirtyChunks, x, y);
+        const z = (i / LC) | 0, rem = i % LC;
+        const x = rem % W, y = (rem / W) | 0;
+        this._addChunkAndBorderNeighbors(this.weightsDirtyChunks, x, y, z);
+        this._addChunkAndBorderNeighbors(this.dirtyChunks, x, y, z);
       }
     }
     this.hasDynamicObstacles = false;
   }
-//#endregion
+  //#endregion
 
-//#region 7: Wall Repulsion & Signed Distance Field (SDF) (#4, #B2)
+  //#region 11: GridWorld Multi-Layer Wall Repulsion & SDF (#4, #B2, #F3, #H3)
   enableWallRepulsion({ penaltyWeight = 1.5, repulsionWeight = 0.35, radius = 2.5 } = {}) {
     this.wallPenaltyWeight = penaltyWeight;
     this.wallRepulsionWeight = repulsionWeight;
@@ -432,142 +607,153 @@ export class GridWorld {
   }
 
   updateWallSDF(forceFull = false) {
-    const { width: W, height: H, costs } = this, len = W * H;
+    const { width: W, height: H, layers: L, layerCells: LC, costs } = this, len = LC * L;
     if (!this.wallDist) {
-      this.wallDist = new Float32Array(len);
-      this.wallGradX = new Float32Array(len);
-      this.wallGradY = new Float32Array(len);
+      this.wallDist = new Float32Array(this._allocBuf(len * 4));
+      this.wallGradX = new Float32Array(this._allocBuf(len * 4));
+      this.wallGradY = new Float32Array(this._allocBuf(len * 4));
       this._sdfFullDirty = true;
     }
     const D = this.wallDist, GX = this.wallGradX, GY = this.wallGradY;
     const maxD = Math.ceil(this.wallPenaltyRadius) + 4;
-    const full = forceFull || this._sdfFullDirty || this._sdfRect.x1 < this._sdfRect.x0;
-    const x0 = full ? 0 : Math.max(0, this._sdfRect.x0 - maxD);
-    const y0 = full ? 0 : Math.max(0, this._sdfRect.y0 - maxD);
-    const x1 = full ? W - 1 : Math.min(W - 1, this._sdfRect.x1 + maxD);
-    const y1 = full ? H - 1 : Math.min(H - 1, this._sdfRect.y1 + maxD);
 
-    for (let y = y0; y <= y1; y++) {
-      const row = y * W;
-      for (let x = x0; x <= x1; x++) {
-        const i = row + x;
-        D[i] = costs[i] >= COST_BLOCK ? 0 : maxD;
-      }
-    }
-    // Forward pass (including halo boundary neighbors if regional)
-    const fy0 = Math.max(0, y0 - 1), fx0 = Math.max(0, x0 - 1);
-    const fy1 = Math.min(H - 1, y1 + 1), fx1 = Math.min(W - 1, x1 + 1);
-    for (let y = fy0; y <= fy1; y++) {
-      const row = y * W;
-      for (let x = fx0; x <= fx1; x++) {
-        const i = row + x;
-        let d = D[i];
-        if (d === 0) continue;
-        if (x > 0 && D[i - 1] + 1 < d) d = D[i - 1] + 1;
-        if (y > 0 && D[i - W] + 1 < d) d = D[i - W] + 1;
-        if (x > 0 && y > 0 && D[i - W - 1] + SQ2 < d) d = D[i - W - 1] + SQ2;
-        if (x < W - 1 && y > 0 && D[i - W + 1] + SQ2 < d) d = D[i - W + 1] + SQ2;
-        D[i] = d;
-      }
-    }
-    // Backward pass
-    for (let y = fy1; y >= fy0; y--) {
-      const row = y * W;
-      for (let x = fx1; x >= fx0; x--) {
-        const i = row + x;
-        let d = D[i];
-        if (d === 0) continue;
-        if (x < W - 1 && D[i + 1] + 1 < d) d = D[i + 1] + 1;
-        if (y < H - 1 && D[i + W] + 1 < d) d = D[i + W] + 1;
-        if (x < W - 1 && y < H - 1 && D[i + W + 1] + SQ2 < d) d = D[i + W + 1] + SQ2;
-        if (x > 0 && y < H - 1 && D[i + W - 1] + SQ2 < d) d = D[i + W - 1] + SQ2;
-        D[i] = d;
-      }
-    }
-    // Outward gradient within updated box
-    for (let y = y0; y <= y1; y++) {
-      const row = y * W;
-      for (let x = x0; x <= x1; x++) {
-        const i = row + x;
-        const dE = D[row + Math.min(W - 1, x + 1)], dW = D[row + Math.max(0, x - 1)];
-        const dS = D[Math.min(H - 1, y + 1) * W + x], dN = D[Math.max(0, y - 1) * W + x];
-        const gx = dE - dW, gy = dS - dN, l = Math.hypot(gx, gy);
-        GX[i] = l > 1e-5 ? gx / l : 0;
-        GY[i] = l > 1e-5 ? gy / l : 0;
+    for (let z = 0; z < L; z++) {
+      const zOff = z * LC;
+      const clusters = this._buildDirtyClusters(this._sdfDirtyChunks, maxD, forceFull || this._sdfFullDirty, z);
+      for (let c = 0; c < clusters.length; c++) {
+        const { x0, y0, x1, y1 } = clusters[c];
+        for (let y = y0; y <= y1; y++) {
+          const row = zOff + y * W;
+          for (let x = x0; x <= x1; x++) {
+            const i = row + x;
+            D[i] = costs[i] >= COST_BLOCK ? 0 : maxD;
+          }
+        }
+        for (let y = y0; y <= y1; y++) {
+          const row = zOff + y * W;
+          for (let x = x0; x <= x1; x++) {
+            const i = row + x;
+            let d = D[i];
+            if (d === 0) continue;
+            if (x > 0 && D[i - 1] + 1 < d) d = D[i - 1] + 1;
+            if (y > 0 && D[i - W] + 1 < d) d = D[i - W] + 1;
+            if (x > 0 && y > 0 && D[i - W - 1] + SQ2 < d) d = D[i - W - 1] + SQ2;
+            if (x < W - 1 && y > 0 && D[i - W + 1] + SQ2 < d) d = D[i - W + 1] + SQ2;
+            D[i] = d;
+          }
+        }
+        for (let y = y1; y >= y0; y--) {
+          const row = zOff + y * W;
+          for (let x = x1; x >= x0; x--) {
+            const i = row + x;
+            let d = D[i];
+            if (d === 0) continue;
+            if (x < W - 1 && D[i + 1] + 1 < d) d = D[i + 1] + 1;
+            if (y < H - 1 && D[i + W] + 1 < d) d = D[i + W] + 1;
+            if (x < W - 1 && y < H - 1 && D[i + W + 1] + SQ2 < d) d = D[i + W + 1] + SQ2;
+            if (x > 0 && y < H - 1 && D[i + W - 1] + SQ2 < d) d = D[i + W - 1] + SQ2;
+            D[i] = d;
+          }
+        }
+        for (let y = y0; y <= y1; y++) {
+          const row = zOff + y * W;
+          for (let x = x0; x <= x1; x++) {
+            const i = row + x;
+            const dE = D[row + Math.min(W - 1, x + 1)], dW = D[row + Math.max(0, x - 1)];
+            const dS = D[zOff + Math.min(H - 1, y + 1) * W + x], dN = D[zOff + Math.max(0, y - 1) * W + x];
+            const gx = dE - dW, gy = dS - dN, l = Math.hypot(gx, gy);
+            GX[i] = l > 1e-5 ? gx / l : 0;
+            GY[i] = l > 1e-5 ? gy / l : 0;
+          }
+        }
       }
     }
     this._sdfDirty = this._sdfFullDirty = false;
-    this._sdfRect.x0 = this._sdfRect.y0 = len;
-    this._sdfRect.x1 = this._sdfRect.y1 = -1;
+    this._sdfDirtyChunks.clear();
   }
-//#endregion
+  //#endregion
 
-//#region 8: Clearance Map & Regional Brushfire (#5, #B2)
+  //#region 12: GridWorld Isotropic & Directional Clearance Sweeps (#5, #B2, #F3, #H4)
+  /**
+   * #5, #B2, #F3 & #H4: Updates isotropic Chebyshev `clearance` AND directional corridor widths
+   * `clearanceX` (E-W span) and `clearanceY` (N-S span) for rectangular vehicle routing.
+   */
   updateClearance(forceFull = false) {
-    const { width: W, height: H, costs } = this, len = W * H;
+    const { width: W, height: H, layers: L, layerCells: LC, costs } = this, len = LC * L;
     if (!this.clearance) {
-      this.clearance = new Uint8Array(len);
+      this.clearance = new Uint8Array(this._allocBuf(len));
+      this.clearanceX = new Uint8Array(this._allocBuf(len));
+      this.clearanceY = new Uint8Array(this._allocBuf(len));
       this._clearanceFullDirty = true;
     }
-    const C = this.clearance;
+    const C = this.clearance, CX = this.clearanceX, CY = this.clearanceY;
     const halo = MAX_CLEARANCE + 2;
-    const full = forceFull || this._clearanceFullDirty || this._clearanceRect.x1 < this._clearanceRect.x0;
-    const x0 = full ? 0 : Math.max(0, this._clearanceRect.x0 - halo);
-    const y0 = full ? 0 : Math.max(0, this._clearanceRect.y0 - halo);
-    const x1 = full ? W - 1 : Math.min(W - 1, this._clearanceRect.x1 + halo);
-    const y1 = full ? H - 1 : Math.min(H - 1, this._clearanceRect.y1 + halo);
 
-    for (let y = y0; y <= y1; y++) {
-      const row = y * W;
-      for (let x = x0; x <= x1; x++) {
-        const i = row + x;
-        if (costs[i] >= COST_BLOCK) C[i] = 0;
-        else if (x === 0 || y === 0 || x === W - 1 || y === H - 1) C[i] = 1;
-        else C[i] = MAX_CLEARANCE;
-      }
-    }
-    const fy0 = Math.max(1, y0), fx0 = Math.max(1, x0);
-    const fy1 = Math.min(H - 2, y1), fx1 = Math.min(W - 2, x1);
-    for (let y = fy0; y <= fy1; y++) {
-      const row = y * W;
-      for (let x = fx0; x <= fx1; x++) {
-        const i = row + x;
-        if (!C[i]) continue;
-        const m = Math.min(C[i - 1], C[i - W], C[i - W - 1], C[i - W + 1]);
-        if (m + 1 < C[i]) C[i] = m + 1;
-      }
-    }
-    for (let y = fy1; y >= fy0; y--) {
-      const row = y * W;
-      for (let x = fx1; x >= fx0; x--) {
-        const i = row + x;
-        if (!C[i]) continue;
-        const m = Math.min(C[i + 1], C[i + W], C[i + W + 1], C[i + W - 1]);
-        if (m + 1 < C[i]) C[i] = m + 1;
+    for (let z = 0; z < L; z++) {
+      const zOff = z * LC;
+      const clusters = this._buildDirtyClusters(this._clearanceDirtyChunks, halo, forceFull || this._clearanceFullDirty, z);
+      for (let c = 0; c < clusters.length; c++) {
+        const { x0, y0, x1, y1 } = clusters[c];
+        for (let y = y0; y <= y1; y++) {
+          const row = zOff + y * W;
+          for (let x = x0; x <= x1; x++) {
+            const i = row + x;
+            if (costs[i] >= COST_BLOCK) {
+              C[i] = CX[i] = CY[i] = 0;
+            } else if (x === 0 || y === 0 || x === W - 1 || y === H - 1) {
+              C[i] = CX[i] = CY[i] = 1;
+            } else {
+              C[i] = CX[i] = CY[i] = MAX_CLEARANCE;
+            }
+          }
+        }
+        const fy0 = Math.max(1, y0), fx0 = Math.max(1, x0);
+        const fy1 = Math.min(H - 2, y1), fx1 = Math.min(W - 2, x1);
+        for (let y = fy0; y <= fy1; y++) {
+          const row = zOff + y * W;
+          for (let x = fx0; x <= fx1; x++) {
+            const i = row + x;
+            if (!C[i]) continue;
+            const m = Math.min(C[i - 1], C[i - W], C[i - W - 1], C[i - W + 1]);
+            if (m + 1 < C[i]) C[i] = m + 1;
+            if (CX[i - 1] + 1 < CX[i]) CX[i] = CX[i - 1] + 1;
+            if (CY[i - W] + 1 < CY[i]) CY[i] = CY[i - W] + 1;
+          }
+        }
+        for (let y = fy1; y >= fy0; y--) {
+          const row = zOff + y * W;
+          for (let x = fx1; x >= fx0; x--) {
+            const i = row + x;
+            if (!C[i]) continue;
+            const m = Math.min(C[i + 1], C[i + W], C[i + W + 1], C[i + W - 1]);
+            if (m + 1 < C[i]) C[i] = m + 1;
+            if (CX[i + 1] + 1 < CX[i]) CX[i] = CX[i + 1] + 1;
+            if (CY[i + W] + 1 < CY[i]) CY[i] = CY[i + W] + 1;
+          }
+        }
       }
     }
     this._clearanceDirty = this._clearanceFullDirty = false;
-    this._clearanceRect.x0 = this._clearanceRect.y0 = len;
-    this._clearanceRect.x1 = this._clearanceRect.y1 = -1;
+    this._clearanceDirtyChunks.clear();
   }
-//#endregion
+  //#endregion
 
-//#region 9: Tactical Overlay, FOV Shadowcasting & Raycasting (#6, #E1)
+  //#region 13: GridWorld Tactical Overlay, FOV Shadowcasting & Raycast (#6, #E1)
   ensureTacticalLayer() {
-    if (!this.tacticalCosts) this.tacticalCosts = new Float32Array(this.width * this.height);
+    if (!this.tacticalCosts) this.tacticalCosts = new Float32Array(this._allocBuf(this.layerCells * this.layers * 4));
     this.hasTactical = true;
     return this.tacticalCosts;
   }
 
-  setTacticalCost(x, y, extraCost) {
-    const ix = x | 0, iy = y | 0;
-    if (!this.inBounds(ix, iy)) return;
-    this.ensureTacticalLayer()[iy * this.width + ix] = Math.max(0, extraCost);
-    this.markChunkWeightDirty(this.chunkIdAt(ix, iy));
+  setTacticalCost(x, y, extraCost, z = 0) {
+    const ix = x | 0, iy = y | 0, iz = z | 0;
+    if (!this.inBounds(ix, iy, iz)) return;
+    this.ensureTacticalLayer()[this.index(ix, iy, iz)] = Math.max(0, extraCost);
+    this.markChunkWeightDirty(this.chunkIdAt(ix, iy, iz));
   }
 
-  addTacticalDisc(wx, wy, r, peakCost, linearFalloff = true) {
-    const T = this.ensureTacticalLayer(), r2 = r * r;
+  addTacticalDisc(wx, wy, r, peakCost, linearFalloff = true, z = 0) {
+    const T = this.ensureTacticalLayer(), r2 = r * r, iz = clamp(z | 0, 0, this.layers - 1);
     const x0 = clamp(Math.floor(wx - r), 0, this.width - 1), x1 = clamp(Math.ceil(wx + r), 0, this.width - 1);
     const y0 = clamp(Math.floor(wy - r), 0, this.height - 1), y1 = clamp(Math.ceil(wy + r), 0, this.height - 1);
     for (let y = y0; y <= y1; y++) {
@@ -575,22 +761,23 @@ export class GridWorld {
         const d2 = (x + 0.5 - wx) ** 2 + (y + 0.5 - wy) ** 2;
         if (d2 > r2) continue;
         const w = linearFalloff ? 1 - Math.sqrt(d2) / r : 1;
-        T[y * this.width + x] += peakCost * w;
-        this.markChunkWeightDirty(this.chunkIdAt(x, y));
+        T[this.index(x, y, iz)] += peakCost * w;
+        this.markChunkWeightDirty(this.chunkIdAt(x, y, iz));
       }
     }
   }
 
-  /**
-   * #E1: Adds tactical threat cost only to cells within Line-of-Sight of `(wx, wy)` using
-   * 8-octant recursive shadowcasting so threat zones never bleed through solid walls.
-   */
-  addTacticalFOV(wx, wy, r, peakCost, linearFalloff = true) {
-    const ox = wx | 0, oy = wy | 0;
-    if (!this.inBounds(ox, oy)) return;
-    const T = this.ensureTacticalLayer(), { width: W, costs } = this, r2 = r * r, maxRow = Math.ceil(r);
-    T[oy * W + ox] += peakCost;
-    this.markChunkWeightDirty(this.chunkIdAt(ox, oy));
+  addTacticalFOV(wx, wy, r, peakCost, linearFalloff = true, onVisibleCell = null, z = 0) {
+    const ox = wx | 0, oy = wy | 0, iz = clamp(z | 0, 0, this.layers - 1);
+    if (!this.inBounds(ox, oy, iz)) return;
+    const T = peakCost > 0 ? this.ensureTacticalLayer() : null;
+    const { width: W, costs } = this, zOff = iz * this.layerCells, r2 = r * r, maxRow = Math.ceil(r);
+    const startIdx = zOff + oy * W + ox;
+    if (T) {
+      T[startIdx] += peakCost;
+      this.markChunkWeightDirty(this.chunkIdAt(ox, oy, iz));
+    }
+    if (onVisibleCell) onVisibleCell(ox, oy, startIdx, 0);
 
     const scanOctant = (row, startSlope, endSlope, xx, xy, yx, yy) => {
       if (startSlope < endSlope) return;
@@ -602,14 +789,18 @@ export class GridWorld {
           if (startSlope < rSlope) continue;
           if (endSlope > lSlope) break;
           const mx = ox + dx * xx + dy * xy, my = oy + dx * yx + dy * yy;
-          if (!this.inBounds(mx, my)) continue;
-          const d2 = dx * dx + dy * dy, idx = my * W + mx;
+          if (!this.inBounds(mx, my, iz)) continue;
+          const d2 = dx * dx + dy * dy, idx = zOff + my * W + mx;
           if (d2 <= r2 && costs[idx] < COST_BLOCK) {
-            const w = linearFalloff ? 1 - Math.sqrt(d2) / r : 1;
-            T[idx] += peakCost * w;
-            this.markChunkWeightDirty(this.chunkIdAt(mx, my));
+            const dist = Math.sqrt(d2);
+            if (T) {
+              const w = linearFalloff ? 1 - dist / r : 1;
+              T[idx] += peakCost * w;
+              this.markChunkWeightDirty(this.chunkIdAt(mx, my, iz));
+            }
+            if (onVisibleCell) onVisibleCell(mx, my, idx, dist);
           }
-          const isWall = !this.inBounds(mx, my) || costs[idx] >= COST_BLOCK;
+          const isWall = !this.inBounds(mx, my, iz) || costs[idx] >= COST_BLOCK;
           if (blocked) {
             if (isWall) nextStart = rSlope;
             else { blocked = false; startSlope = nextStart; }
@@ -635,22 +826,21 @@ export class GridWorld {
 
   clearTacticalCosts() {
     if (!this.tacticalCosts || !this.hasTactical) return;
-    const T = this.tacticalCosts, W = this.width;
+    const T = this.tacticalCosts, W = this.width, LC = this.layerCells;
     for (let i = 0; i < T.length; i++) {
       if (T[i] > 0) {
         T[i] = 0;
-        this.markChunkWeightDirty(this.chunkIdAt(i % W, (i / W) | 0));
+        const z = (i / LC) | 0, rem = i % LC;
+        this.markChunkWeightDirty(this.chunkIdAt(rem % W, (rem / W) | 0, z));
       }
     }
     this.hasTactical = false;
   }
 
-  /**
-   * #E1: Global world-space supercover DDA raycast supporting clearance and maxCost thresholds.
-   */
   raycast(x0, y0, x1, y1, opts = {}) {
     const minClearance = opts.minClearance ?? 1;
     const maxCost = opts.maxCost ?? (COST_BLOCK - 1);
+    const iz = clamp((opts.layer ?? 0) | 0, 0, this.layers - 1);
     const pTable = this.getProfileTable(opts.profile);
     if (minClearance > 1 && (this._clearanceDirty || !this.clearance)) this.updateClearance();
 
@@ -661,8 +851,8 @@ export class GridWorld {
     let err = dx - dy;
 
     const checkCell = (x, y) => {
-      if (!this.inBounds(x, y)) return false;
-      const idx = y * this.width + x;
+      if (!this.inBounds(x, y, iz)) return false;
+      const idx = this.index(x, y, iz);
       if (this.getEffectiveBaseCost(idx, pTable) > maxCost) return false;
       if (minClearance > 1 && this.clearance[idx] < minClearance) return false;
       return true;
@@ -671,80 +861,80 @@ export class GridWorld {
     while (true) {
       if (!checkCell(cx, cy)) {
         const hx = clamp(cx + 0.5, 0, this.width), hy = clamp(cy + 0.5, 0, this.height);
-        return { hit: true, x: hx, y: hy, cell: this.inBounds(cx, cy) ? cy * this.width + cx : -1, distance: Math.hypot(hx - x0, hy - y0) };
+        return { hit: true, x: hx, y: hy, layer: iz, cell: this.inBounds(cx, cy, iz) ? this.index(cx, cy, iz) : -1, distance: Math.hypot(hx - x0, hy - y0) };
       }
       if (cx === ex && cy === ey) {
-        return { hit: false, x: x1, y: y1, cell: ey * this.width + ex, distance: Math.hypot(x1 - x0, y1 - y0) };
+        return { hit: false, x: x1, y: y1, layer: iz, cell: this.index(ex, ey, iz), distance: Math.hypot(x1 - x0, y1 - y0) };
       }
       const e2 = 2 * err;
       if (e2 > -dy && e2 < dx) {
         if (!checkCell(cx + sx, cy) || !checkCell(cx, cy + sy)) {
           const hx = cx + 0.5, hy = cy + 0.5;
-          return { hit: true, x: hx, y: hy, cell: cy * this.width + cx, distance: Math.hypot(hx - x0, hy - y0) };
+          return { hit: true, x: hx, y: hy, layer: iz, cell: this.index(cx, cy, iz), distance: Math.hypot(hx - x0, hy - y0) };
         }
       }
       if (e2 > -dy) { err -= dy; cx += sx; }
       if (e2 < dx) { err += dx; cy += sy; }
     }
   }
-//#endregion
+  //#endregion
 
-//#region 10: Continuum Crowd Congestion & Velocity-Flux Layer (#9, #C1)
+  //#region 14: GridWorld Continuum Crowd Congestion & Velocity-Flux Layer (#9, #C1)
   ensureCongestionLayer(withFlux = false) {
-    const len = this.width * this.height;
-    if (!this.congestion) this.congestion = new Float32Array(len);
+    const len = this.layerCells * this.layers;
+    if (!this.congestion) this.congestion = new Float32Array(this._allocBuf(len * 4));
     if (withFlux && !this.congestionFluxX) {
-      this.congestionFluxX = new Float32Array(len);
-      this.congestionFluxY = new Float32Array(len);
+      this.congestionFluxX = new Float32Array(this._allocBuf(len * 4));
+      this.congestionFluxY = new Float32Array(this._allocBuf(len * 4));
     }
     this.hasCongestion = true;
     if (withFlux) this.hasCongestionFlux = true;
     return this.congestion;
   }
 
-  addCongestion(wx, wy, amount = 1.0, vx = 0, vy = 0) {
-    const ix = wx | 0, iy = wy | 0;
-    if (!this.inBounds(ix, iy)) return;
+  addCongestion(wx, wy, amount = 1.0, vx = 0, vy = 0, z = 0) {
+    const ix = wx | 0, iy = wy | 0, iz = z | 0;
+    if (!this.inBounds(ix, iy, iz)) return;
     const hasVel = vx !== 0 || vy !== 0;
-    const C = this.ensureCongestionLayer(hasVel), idx = iy * this.width + ix;
+    const C = this.ensureCongestionLayer(hasVel), idx = this.index(ix, iy, iz);
     C[idx] += amount;
     if (hasVel) {
       this.congestionFluxX[idx] += vx * amount;
       this.congestionFluxY[idx] += vy * amount;
     }
-    this.markChunkWeightDirty(this.chunkIdAt(ix, iy));
+    this.markChunkWeightDirty(this.chunkIdAt(ix, iy, iz));
   }
 
-  /** #C1: Stamps directional agent velocity flux for bi-directional lane formation */
-  addAgentFlux(wx, wy, vx, vy, amount = 1.0) {
-    this.addCongestion(wx, wy, amount, vx, vy);
+  addAgentFlux(wx, wy, vx, vy, amount = 1.0, z = 0) {
+    this.addCongestion(wx, wy, amount, vx, vy, z);
   }
 
-  setCongestionFromAgents(px, py, count, unitWeight = 1.0, vx = null, vy = null) {
+  setCongestionFromAgents(px, py, count, unitWeight = 1.0, vx = null, vy = null, pz = null) {
     const withFlux = !!(vx && vy);
-    const C = this.ensureCongestionLayer(withFlux), { width: W, height: H } = this;
+    const C = this.ensureCongestionLayer(withFlux), { width: W, height: H, layers: L } = this;
     C.fill(0);
     if (withFlux) {
       this.congestionFluxX.fill(0);
       this.congestionFluxY.fill(0);
     }
     for (let i = 0; i < count; i++) {
-      const x = px[i] | 0, y = py[i] | 0;
-      if (x >= 0 && x < W && y >= 0 && y < H) {
-        const idx = y * W + x;
+      const x = px[i] | 0, y = py[i] | 0, z = pz ? (pz[i] | 0) : 0;
+      if (x >= 0 && x < W && y >= 0 && y < H && z >= 0 && z < L) {
+        const idx = this.index(x, y, z);
         C[idx] += unitWeight;
         if (withFlux) {
           this.congestionFluxX[idx] += vx[i] * unitWeight;
           this.congestionFluxY[idx] += vy[i] * unitWeight;
         }
-        this.markChunkWeightDirty(this.chunkIdAt(x, y));
+        this.markChunkWeightDirty(this.chunkIdAt(x, y, z));
       }
     }
   }
 
   decayCongestion(decayFactor = 0.85, eps = 0.05) {
     if (!this.congestion || !this.hasCongestion) return;
-    const C = this.congestion, FX = this.congestionFluxX, FY = this.congestionFluxY, W = this.width;
+    const C = this.congestion, FX = this.congestionFluxX, FY = this.congestionFluxY;
+    const W = this.width, LC = this.layerCells;
     let active = false;
     for (let i = 0; i < C.length; i++) {
       if (C[i] > 0) {
@@ -756,75 +946,77 @@ export class GridWorld {
         } else {
           active = true;
         }
-        this.markChunkWeightDirty(this.chunkIdAt(i % W, (i / W) | 0));
+        const z = (i / LC) | 0, rem = i % LC;
+        this.markChunkWeightDirty(this.chunkIdAt(rem % W, (rem / W) | 0, z));
       }
     }
     this.hasCongestion = active;
     if (!active) this.hasCongestionFlux = false;
   }
-//#endregion
+  //#endregion
 
-//#region 11: Anisotropic Passability, Vector Currents & Nearest Walkable (#11, #A5)
+  //#region 15: GridWorld Anisotropic Passability, Currents & Nearest Walkable (#11, #A5)
   ensureAnisotropicLayer() {
-    const len = this.width * this.height;
-    if (!this.dirMask) this.dirMask = new Uint8Array(len).fill(DIR_FLAGS.ALL);
+    const len = this.layerCells * this.layers;
+    if (!this.dirMask) this.dirMask = new Uint8Array(this._allocBuf(len)).fill(DIR_FLAGS.ALL);
     if (!this.currentX) {
-      this.currentX = new Float32Array(len);
-      this.currentY = new Float32Array(len);
+      this.currentX = new Float32Array(this._allocBuf(len * 4));
+      this.currentY = new Float32Array(this._allocBuf(len * 4));
     }
     this.hasAnisotropy = true;
   }
 
-  setDirectionMask(x, y, mask = DIR_FLAGS.ALL) {
-    const ix = x | 0, iy = y | 0;
-    if (!this.inBounds(ix, iy)) return;
+  setDirectionMask(x, y, mask = DIR_FLAGS.ALL, z = 0) {
+    const ix = x | 0, iy = y | 0, iz = z | 0;
+    if (!this.inBounds(ix, iy, iz)) return;
     this.ensureAnisotropicLayer();
-    this.dirMask[iy * this.width + ix] = mask & 0xFF;
-    this.markCellDirty(ix, iy, true);
+    this.dirMask[this.index(ix, iy, iz)] = mask & 0xFF;
+    this.markCellDirty(ix, iy, true, iz);
   }
 
-  setCurrent(x, y, vx, vy) {
-    const ix = x | 0, iy = y | 0;
-    if (!this.inBounds(ix, iy)) return;
+  setCurrent(x, y, vx, vy, z = 0) {
+    const ix = x | 0, iy = y | 0, iz = z | 0;
+    if (!this.inBounds(ix, iy, iz)) return;
     this.ensureAnisotropicLayer();
-    const idx = iy * this.width + ix;
+    const idx = this.index(ix, iy, iz);
     this.currentX[idx] = vx;
     this.currentY[idx] = vy;
-    this.markCellDirty(ix, iy, false);
+    this.markCellDirty(ix, iy, false, iz);
   }
 
-  setRectCurrent(x, y, w, h, vx, vy) {
+  setRectCurrent(x, y, w, h, vx, vy, z = 0) {
     this.ensureAnisotropicLayer();
     const x0 = clamp(Math.floor(x), 0, this.width), x1 = clamp(Math.ceil(x + w), 0, this.width);
     const y0 = clamp(Math.floor(y), 0, this.height), y1 = clamp(Math.ceil(y + h), 0, this.height);
     for (let yy = y0; yy < y1; yy++) {
       for (let xx = x0; xx < x1; xx++) {
-        const idx = yy * this.width + xx;
+        const idx = this.index(xx, yy, z);
         this.currentX[idx] = vx;
         this.currentY[idx] = vy;
-        this.markCellDirty(xx, yy, false);
+        this.markCellDirty(xx, yy, false, z);
       }
     }
   }
 
-  setSlopeFromHeightmap(heights, slopeScale = 1.0) {
+  setSlopeFromHeightmap(heights, slopeScale = 1.0, z = 0) {
     this.ensureAnisotropicLayer();
-    const { width: W, height: H, currentX: CX, currentY: CY } = this;
+    const { width: W, height: H, currentX: CX, currentY: CY } = this, zOff = z * this.layerCells;
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
         const i = y * W + x;
         const hE = heights[y * W + Math.min(W - 1, x + 1)], hW = heights[y * W + Math.max(0, x - 1)];
         const hS = heights[Math.min(H - 1, y + 1) * W + x], hN = heights[Math.max(0, y - 1) * W + x];
-        CX[i] = -(hE - hW) * 0.5 * slopeScale;
-        CY[i] = -(hS - hN) * 0.5 * slopeScale;
+        CX[zOff + i] = -(hE - hW) * 0.5 * slopeScale;
+        CY[zOff + i] = -(hS - hN) * 0.5 * slopeScale;
       }
     }
-    for (let c = 0; c < this.chunkCount; c++) this.markChunkWeightDirty(c);
+    for (let c = z * this.layerChunks; c < (z + 1) * this.layerChunks; c++) this.markChunkWeightDirty(c);
   }
 
-  findNearestWalkable(x, y, maxR = 24, minClearance = 1, profile = null) {
-    const { width: W, height: H } = this, sx = clamp(x | 0, 0, W - 1), sy = clamp(y | 0, 0, H - 1);
-    if (this.isWalkable(sx, sy, minClearance, profile)) return sy * W + sx;
+  findNearestWalkable(x, y, maxR = 24, minClearance = 1, profile = null, z = 0, footprint = null) {
+    const { width: W, height: H } = this;
+    const sx = clamp(x | 0, 0, W - 1), sy = clamp(y | 0, 0, H - 1), sz = clamp(z | 0, 0, this.layers - 1);
+    if (this.isWalkable(sx, sy, minClearance, profile, sz, footprint)) return this.index(sx, sy, sz);
     let bestD = Infinity, bestI = -1;
     for (let r = 1, lim = Math.min(maxR, Math.max(W, H)); r <= lim; r++) {
       const r2 = r * r;
@@ -835,8 +1027,8 @@ export class GridWorld {
           if (dx * dx < r2 && dy * dy < r2) continue;
           const nx = sx + dx;
           if (nx >= 0 && nx < W) {
-            const idx = ny * W + nx, d = dx * dx + dy * dy;
-            if (this.isWalkable(nx, ny, minClearance, profile) && d < bestD) { bestD = d; bestI = idx; }
+            const idx = this.index(nx, ny, sz), d = dx * dx + dy * dy;
+            if (this.isWalkable(nx, ny, minClearance, profile, sz, footprint) && d < bestD) { bestD = d; bestI = idx; }
           }
         }
       }
@@ -844,86 +1036,113 @@ export class GridWorld {
     }
     return -1;
   }
+  //#endregion
 }
-//#endregion
 
-//#region 12: Chunk Boundary Portal Detection & Crossing Costs (#A2, #A5, #D4)
+//#region 16: Multi-Layer Portal Detection & Crossing Cost Helpers (#A2, #A5, #D4, #H3, #H4)
 /**
- * #A2 & #A5: Detects chunk boundary portals, splitting wide runs (> `maxPortalLen`) into sub-portals
- * and checking anisotropic directional masks across chunk borders.
+ * #A2, #A5, #H3 & #H4: Detects chunk boundary portals across all 2.5D vertical layers,
+ * splitting wide runs (> `maxPortalLen`), checking directional masks and rectangular footprints,
+ * and appending vertical stair/ramp portals between floors.
  */
-export function detectPortals(grid, minClearance = 1, maxPortalLen = MAX_PORTAL_LEN, profile = null) {
-  const portals = [], { cx, cy, width } = grid;
+export function detectPortals(grid, minClearance = 1, maxPortalLen = MAX_PORTAL_LEN, profile = null, footprint = null) {
+  const portals = [], { cx, cy, width, layers, layerChunks, layerCells } = grid;
   const hasDir = grid.hasAnisotropy && grid.dirMask;
-  const pushSegment = (isH, cA, cB, border, bIdx, origin, segRun, segLen) => {
-    const start = origin + segRun, mid = (segLen - 1) >> 1, cMid = start + mid;
-    const cellsA = new Int32Array(segLen), cellsB = new Int32Array(segLen);
-    const at = (u, v) => isH ? v * width + u : u * width + v;
-    const dirAB = isH ? DIR_FLAGS.S : DIR_FLAGS.E;
-    const dirBA = isH ? DIR_FLAGS.N : DIR_FLAGS.W;
-    let canAB = false, canBA = false;
-    for (let k = 0; k < segLen; k++) {
-      const ca = at(start + k, border - 1), cb = at(start + k, border);
-      cellsA[k] = ca; cellsB[k] = cb;
-      if (!hasDir || (grid.dirMask[ca] & dirAB)) canAB = true;
-      if (!hasDir || (grid.dirMask[cb] & dirBA)) canBA = true;
-    }
-    if (!canAB && !canBA) return;
-    portals.push({
-      id: portals.length,
-      uid: (bIdx * CS + segRun) * (CS + 1) + segLen,
-      isH, chunkA: cA, chunkB: cB, border, start, end: start + segLen - 1,
-      cellsA, cellsB, centerA: cellsA[mid], centerB: cellsB[mid],
-      canAB, canBA,
-      anchorX: isH ? cMid + 0.5 : border, anchorY: isH ? border : cMid + 0.5
-    });
-  };
 
-  for (const isH of [false, true]) {
-    const countX = cx - !isH, countY = cy - isH, bOffset = isH ? cy * (cx - 1) : 0;
-    const W = (u, v) => grid.isWalkable(isH ? u : v, isH ? v : u, minClearance, profile);
-    const at = (u, v) => isH ? v * width + u : u * width + v;
-    const dirAB = isH ? DIR_FLAGS.S : DIR_FLAGS.E;
-    const dirBA = isH ? DIR_FLAGS.N : DIR_FLAGS.W;
-    for (let y = 0; y < countY; y++) {
-      for (let x = 0; x < countX; x++) {
-        const border = ((isH ? y : x) + 1) * CS, origin = (isH ? x : y) * CS;
-        const cA = y * cx + x, cB = cA + (isH ? cx : 1), bIdx = bOffset + y * countX + x;
-        let run = -1;
-        for (let t = 0; t <= CS; t++) {
-          let pass = t < CS && W(origin + t, border - 1) && W(origin + t, border);
-          if (pass && hasDir) {
-            const ca = at(origin + t, border - 1), cb = at(origin + t, border);
-            pass = ((grid.dirMask[ca] & dirAB) !== 0) || ((grid.dirMask[cb] & dirBA) !== 0);
-          }
-          if (pass) {
-            if (run < 0) run = t;
-          } else if (run >= 0) {
-            const totalLen = t - run;
-            const splits = maxPortalLen > 0 ? Math.ceil(totalLen / maxPortalLen) : 1;
-            let cur = run;
-            for (let s = 0; s < splits; s++) {
-              const rem = (run + totalLen) - cur;
-              const segLen = Math.ceil(rem / (splits - s));
-              pushSegment(isH, cA, cB, border, bIdx, origin, cur, segLen);
-              cur += segLen;
+  for (let z = 0; z < layers; z++) {
+    const zChunkOff = z * layerChunks, zCellOff = z * layerCells;
+    const bLayerOff = z * (2 * cy * cx);
+
+    const pushSegment = (isH, cA, cB, border, bIdx, origin, segRun, segLen) => {
+      const start = origin + segRun, mid = (segLen - 1) >> 1, cMid = start + mid;
+      const cellsA = new Int32Array(segLen), cellsB = new Int32Array(segLen);
+      const at = (u, v) => zCellOff + (isH ? v * width + u : u * width + v);
+      const dirAB = isH ? DIR_FLAGS.S : DIR_FLAGS.E;
+      const dirBA = isH ? DIR_FLAGS.N : DIR_FLAGS.W;
+      let canAB = false, canBA = false;
+      for (let k = 0; k < segLen; k++) {
+        const ca = at(start + k, border - 1), cb = at(start + k, border);
+        cellsA[k] = ca; cellsB[k] = cb;
+        if (!hasDir || (grid.dirMask[ca] & dirAB)) canAB = true;
+        if (!hasDir || (grid.dirMask[cb] & dirBA)) canBA = true;
+      }
+      if (!canAB && !canBA) return;
+      portals.push({
+        id: portals.length,
+        uid: ((bLayerOff + bIdx) * CS + segRun) * (CS + 1) + segLen,
+        isH, isVertical: false, layer: z,
+        chunkA: cA, chunkB: cB, border, start, end: start + segLen - 1,
+        cellsA, cellsB, centerA: cellsA[mid], centerB: cellsB[mid],
+        canAB, canBA,
+        anchorX: isH ? cMid + 0.5 : border, anchorY: isH ? border : cMid + 0.5
+      });
+    };
+
+    for (const isH of [false, true]) {
+      const countX = cx - !isH, countY = cy - isH, bOffset = isH ? cy * (cx - 1) : 0;
+      const W = (u, v) => grid.isWalkable(isH ? u : v, isH ? v : u, minClearance, profile, z, footprint);
+      const at = (u, v) => zCellOff + (isH ? v * width + u : u * width + v);
+      const dirAB = isH ? DIR_FLAGS.S : DIR_FLAGS.E;
+      const dirBA = isH ? DIR_FLAGS.N : DIR_FLAGS.W;
+      for (let y = 0; y < countY; y++) {
+        for (let x = 0; x < countX; x++) {
+          const border = ((isH ? y : x) + 1) * CS, origin = (isH ? x : y) * CS;
+          const cA = zChunkOff + y * cx + x, cB = cA + (isH ? cx : 1), bIdx = bOffset + y * countX + x;
+          let run = -1;
+          for (let t = 0; t <= CS; t++) {
+            let pass = t < CS && W(origin + t, border - 1) && W(origin + t, border);
+            if (pass && hasDir) {
+              const ca = at(origin + t, border - 1), cb = at(origin + t, border);
+              pass = ((grid.dirMask[ca] & dirAB) !== 0) || ((grid.dirMask[cb] & dirBA) !== 0);
             }
-            run = -1;
+            if (pass) {
+              if (run < 0) run = t;
+            } else if (run >= 0) {
+              const totalLen = t - run;
+              const splits = maxPortalLen > 0 ? Math.ceil(totalLen / maxPortalLen) : 1;
+              let cur = run;
+              for (let s = 0; s < splits; s++) {
+                const rem = (run + totalLen) - cur;
+                const segLen = Math.ceil(rem / (splits - s));
+                pushSegment(isH, cA, cB, border, bIdx, origin, cur, segLen);
+                cur += segLen;
+              }
+              run = -1;
+            }
           }
         }
       }
     }
+  }
+
+  // #H3: Append Vertical Stair / Ramp / Overpass Portals connecting 2.5D layers
+  for (let v = 0; v < grid.verticalPortals.length; v++) {
+    const vp = grid.verticalPortals[v];
+    portals.push({
+      id: portals.length,
+      uid: 0x10000000 + v,
+      isH: false, isVertical: true,
+      layerA: vp.layerA, layerB: vp.layerB,
+      chunkA: vp.chunkA, chunkB: vp.chunkB,
+      border: vp.anchorX | 0, start: vp.anchorY | 0, end: vp.anchorY | 0,
+      cellsA: vp.cellsA, cellsB: vp.cellsB,
+      centerA: vp.centerA, centerB: vp.centerB,
+      canAB: vp.canAB, canBA: vp.canBA,
+      verticalCost: vp.cost,
+      exitX: vp.exitX, exitY: vp.exitY,
+      anchorX: vp.anchorX, anchorY: vp.anchorY
+    });
   }
   return portals;
 }
 
 export const portalSideCells = (p, c) => c === p.chunkA ? p.cellsA : p.cellsB;
 export const portalCenterCell = (p, c) => c === p.chunkA ? p.centerA : p.centerB;
-export const portalExitX = (p, c) => p.isH ? 0 : c === p.chunkA ? 1 : -1;
-export const portalExitY = (p, c) => p.isH ? c === p.chunkA ? 1 : -1 : 0;
+export const portalExitX = (p, c) => p.isVertical ? (p.exitX || 0) : (p.isH ? 0 : c === p.chunkA ? 1 : -1);
+export const portalExitY = (p, c) => p.isVertical ? (p.exitY || 0) : (p.isH ? c === p.chunkA ? 1 : -1 : 0);
 export const pLocal = (grid, p, c) => grid.localIndex(portalCenterCell(p, c));
 
-/** #A5 & #D4: Anisotropic and profile-aware portal boundary crossing cost */
+/** #A5, #D4 & #H3: Anisotropic, profile-aware, and 2.5D vertical portal crossing cost */
 export const crossingCost = (grid, p, fromChunk = p.chunkA, profile = null) => {
   if (fromChunk === p.chunkA && p.canAB === false) return Infinity;
   if (fromChunk === p.chunkB && p.canBA === false) return Infinity;
@@ -931,6 +1150,7 @@ export const crossingCost = (grid, p, fromChunk = p.chunkA, profile = null) => {
   const cA = grid.getEffectiveBaseCost(p.centerA, pTable);
   const cB = grid.getEffectiveBaseCost(p.centerB, pTable);
   if (cA >= COST_BLOCK || cB >= COST_BLOCK) return Infinity;
+  if (p.isVertical) return p.verticalCost ?? COST_OPEN;
   let cost = ((cA + cB) * 0.5) / COST_OPEN;
   if (grid.hasAnisotropy && grid.currentX) {
     const fromCell = fromChunk === p.chunkA ? p.centerA : p.centerB;
@@ -942,24 +1162,20 @@ export const crossingCost = (grid, p, fromChunk = p.chunkA, profile = null) => {
 };
 //#endregion
 
-//#region 13: Multi-Mode Eikonal & Flee Chunk Integrator (#1, #A5, #C1, #I1)
+//#region 17: Multi-Mode Eikonal & Flee Chunk Integrator (#1, #A5, #H3, #H4, #I1)
 /**
  * Multi-mode chunk integrator supporting:
  * - #1, #A5 & #I1: Float32 per-cell Eikonal quadratic upwind solver
- * - #2: Multi-source geodesic Voronoi (`sourceOut`)
- * - #4: Wall SDF penalty buffer
- * - #5: Clearance filtering (`minClearance`)
- * - #6: Tactical cost overlays
- * - #8: 2-pass Flee / Evasion safety integration (`integrateFlee`)
- * - #9 & #C1: Continuum crowd congestion + directional velocity-flux lane formation
- * - #11: Anisotropic directional masks & vector currents
- * - #C3 & #D4: Dynamic moving obstacles & terrain movement profiles
+ * - #H3: 2.5D Multi-layer chunk addressing
+ * - #H4: Anisotropic Rectangular Footprint (`opts.footprint = { width, length, turnPenalty }`)
+ *        restricting heading directions in narrow corridors and penalizing tight turns
  */
 export class ChunkIntegrator {
   heap = new MinHeap(CC * 2);
   costs = new Float32Array(CC);
   blocked = new Uint8Array(CC);
   dirMasks = new Uint8Array(CC);
+  turnPenaltyCell = new Float32Array(CC);
   curX = new Float32Array(CC);
   curY = new Float32Array(CC);
   fluxX = new Float32Array(CC);
@@ -967,11 +1183,17 @@ export class ChunkIntegrator {
   dist = new Float32Array(CC);
   fleeBuf = new Float32Array(CC);
 
-  prepareChunk(grid, chunkId, minClearance = 1, profile = null) {
-    const { costs, blocked, dirMasks, curX, curY, fluxX, fluxY } = this;
-    const ox = grid.chunkOriginX(chunkId), oy = grid.chunkOriginY(chunkId), W = grid.width;
-    const useClearance = minClearance > 1;
+  prepareChunk(grid, chunkId, minClearance = 1, profile = null, footprint = null) {
+    const { costs, blocked, dirMasks, turnPenaltyCell, curX, curY, fluxX, fluxY } = this;
+    const ox = grid.chunkOriginX(chunkId), oy = grid.chunkOriginY(chunkId);
+    const zOff = grid.chunkLayer(chunkId) * grid.layerCells, W = grid.width;
+
+    const fpW = footprint ? Math.min(footprint.width ?? 1, footprint.length ?? 1) : minClearance;
+    const fpL = footprint ? Math.max(footprint.width ?? 1, footprint.length ?? 1) : fpW;
+    const fpTurn = footprint ? (footprint.turnPenalty ?? 2.0) : 0;
+    const useClearance = fpW > 1 || fpL > 1;
     if (useClearance && (grid._clearanceDirty || !grid.clearance)) grid.updateClearance();
+
     const useWall = grid.wallPenaltyWeight > 0;
     if (useWall && (grid._sdfDirty || !grid.wallDist)) grid.updateWallSDF();
 
@@ -983,17 +1205,31 @@ export class ChunkIntegrator {
     const wallR = grid.wallPenaltyRadius, wallW = grid.wallPenaltyWeight;
 
     for (let ly = 0; ly < CS; ly++) {
-      const gy = oy + ly, row = gy * W + ox, lRow = ly * CS;
+      const gy = oy + ly, row = zOff + gy * W + ox, lRow = ly * CS;
       for (let lx = 0; lx < CS; lx++) {
         const gIdx = row + lx, lIdx = lRow + lx;
         const baseC = grid.getEffectiveBaseCost(gIdx, pTable);
-        if (baseC >= COST_BLOCK || (useClearance && grid.clearance[gIdx] < minClearance)) {
-          blocked[lIdx] = 1;
-          costs[lIdx] = COST_BLOCK;
-          continue;
+        if (baseC >= COST_BLOCK) {
+          blocked[lIdx] = 1; costs[lIdx] = COST_BLOCK; continue;
+        }
+        let orientMask = 0xFF;
+        turnPenaltyCell[lIdx] = 0;
+        if (useClearance) {
+          const isoClr = grid.clearance[gIdx];
+          if (isoClr < fpW) { blocked[lIdx] = 1; costs[lIdx] = COST_BLOCK; continue; }
+          if (fpL > fpW) {
+            const cxSpan = grid.clearanceX[gIdx], cySpan = grid.clearanceY[gIdx];
+            if (cxSpan < fpL && cySpan < fpL) { blocked[lIdx] = 1; costs[lIdx] = COST_BLOCK; continue; }
+            // #H4: If corridor is narrower than vehicle length, restrict movement to aligned corridor axis
+            if (isoClr < fpL) {
+              turnPenaltyCell[lIdx] = fpTurn * (1 - isoClr / fpL);
+              if (cxSpan < fpL) orientMask &= (DIR_FLAGS.N | DIR_FLAGS.S);
+              else if (cySpan < fpL) orientMask &= (DIR_FLAGS.E | DIR_FLAGS.W);
+            }
+          }
         }
         blocked[lIdx] = 0;
-        let eff = baseC;
+        let eff = baseC + turnPenaltyCell[lIdx];
         if (hasTac) eff += grid.tacticalCosts[gIdx];
         if (hasCong) eff += grid.congestion[gIdx] * grid.congestionWeight;
         if (useWall) {
@@ -1002,11 +1238,11 @@ export class ChunkIntegrator {
         }
         costs[lIdx] = Math.max(0.25, eff);
         if (hasAniso) {
-          dirMasks[lIdx] = grid.dirMask[gIdx];
+          dirMasks[lIdx] = grid.dirMask[gIdx] & orientMask;
           curX[lIdx] = grid.currentX[gIdx];
           curY[lIdx] = grid.currentY[gIdx];
         } else {
-          dirMasks[lIdx] = 0xFF;
+          dirMasks[lIdx] = orientMask;
           curX[lIdx] = curY[lIdx] = 0;
         }
         if (hasFlux) {
@@ -1025,10 +1261,11 @@ export class ChunkIntegrator {
     const forward = !!opts.forward;
     const sourceOut = opts.sourceOut || null;
     const sourceWeights = opts.sourceWeights || null;
+    const footprint = opts.footprint || null;
 
-    this.prepareChunk(grid, chunkId, minClearance, opts.profile);
+    this.prepareChunk(grid, chunkId, minClearance, opts.profile, footprint);
     const { costs, blocked, dirMasks, curX, curY, fluxX, fluxY, dist, heap } = this;
-    const hasAniso = grid.hasAnisotropy;
+    const hasAniso = grid.hasAnisotropy || !!(footprint && (footprint.length !== footprint.width));
     const hasFlux = grid.hasCongestionFlux;
     const curStr = grid.currentStrength;
     const laneW = grid.congestionLaneWeight;
@@ -1139,44 +1376,43 @@ export class ChunkIntegrator {
 }
 //#endregion
 
-//#region 14: Abstract Portal Graph, Tarjan SCC & Traffic Throttling (#B1, #D1, #G4, #H2)
 /**
  * High-level abstract graph connecting chunk boundary portals in CSR format.
  * Supports:
- * - #A2: Multi-cell portal span evaluation
- * - #B1 & #I1: Flat Float32 CSR & in-place weight refreshes (`refreshWeights`)
- * - #D1 & #H2: Undirected components (`portalComp`) + Tarjan's Directed SCC & 64-Bit DAG Reachability Bitsets
- * - #G4: Dynamic Portal Flux Throttling (`portalTraffic`) for Wardrop traffic load-balancing
+ * - #H3: 2.5D Multi-Floor chunks & vertical stair/ramp portals
+ * - #H4: Rectangular vehicle footprint filtering
+ * - #I4: Two-Level Hierarchical Super-Chunks (64x64 Macro Tier) for long-range search pruning
  */
 export class PortalGraph {
-  constructor(grid, prevGraph = null, dirtyChunks = null, minClearance = 1, profile = null) {
+  //#region 18: PortalGraph Construction & Intra-Chunk Distance Tables
+  constructor(grid, prevGraph = null, dirtyChunks = null, minClearance = 1, profile = null, footprint = null) {
     this.grid = grid;
     this.minClearance = minClearance;
     this.profile = profile;
+    this.footprint = footprint;
     this.weightVersion = prevGraph ? prevGraph.weightVersion + 1 : 1;
 
-    const portals = this.portals = detectPortals(grid, minClearance, MAX_PORTAL_LEN, profile), P = portals.length;
+    const portals = this.portals = detectPortals(grid, minClearance, MAX_PORTAL_LEN, profile, footprint), P = portals.length;
     const lists = Array.from({ length: grid.chunkCount }, () => []);
     for (let i = 0; i < P; i++) {
       const p = portals[i];
       lists[p.chunkA].push(p.id); lists[p.chunkB].push(p.id);
     }
     const chunkPortals = this.chunkPortals = lists.map(l => new Int32Array(l));
-    const canReuse = prevGraph && prevGraph.minClearance === minClearance && prevGraph.profile === profile && dirtyChunks;
+    const sameFp = prevGraph && JSON.stringify(prevGraph.footprint) === JSON.stringify(footprint);
+    const canReuse = prevGraph && prevGraph.minClearance === minClearance && prevGraph.profile === profile && sameFp && dirtyChunks;
 
-    // #I1: Float32 cached intra-chunk rows
     this.chunkDistCache = Array.from({ length: grid.chunkCount }, (_, c) =>
       canReuse && !dirtyChunks.has(c) ? prevGraph.chunkDistCache[c] : new Map()
     );
 
-    // #G4: Real-time portal traffic flux counters for Wardrop load-balancing
     this.portalTraffic = new Float32Array(P);
     this.trafficWeight = 1.25;
 
     const adj = Array.from({ length: P }, () => []);
     const it = this._it = new ChunkIntegrator();
     const field = this._field = new Float32Array(CC);
-    const itOpts = { minClearance, profile };
+    const itOpts = { minClearance, profile, footprint };
 
     for (let c = 0; c < grid.chunkCount; c++) {
       const ids = chunkPortals[c];
@@ -1222,6 +1458,7 @@ export class PortalGraph {
     }
 
     this._buildReverseAndComponents();
+    this._buildSuperChunkHierarchy();
   }
 
   _samplePortalRowDist(row, pB, chunk) {
@@ -1234,7 +1471,9 @@ export class PortalGraph {
     }
     return centerD < Infinity ? (0.65 * minD + 0.35 * centerD) : minD;
   }
+  //#endregion
 
+  //#region 19: PortalGraph Reverse CSR, Connected Components & Tarjan SCC (#H2)
   _buildReverseAndComponents() {
     const P = this.portals.length, E = this.edgeTargets.length;
     const revCounts = new Int32Array(P);
@@ -1252,7 +1491,6 @@ export class PortalGraph {
       }
     }
 
-    // #D1: Undirected Connected Component Labeling
     const comp = this.portalComp = new Int32Array(P).fill(-1);
     const queue = new Int32Array(P);
     let compId = 0;
@@ -1334,7 +1572,6 @@ export class PortalGraph {
       if (bit < 32) rLo[s] = 1 << bit;
       else rHi[s] = 1 << (bit - 32);
     }
-    // Tarjan emits SCCs in reverse topological order (0 = sink, sccCnt-1 = source)
     for (let u = 0; u < P; u++) {
       const su = scc[u];
       for (let e = this.edgeOffsets[u]; e < this.edgeOffsets[u + 1]; e++) {
@@ -1345,7 +1582,6 @@ export class PortalGraph {
         }
       }
     }
-    // Second sweep to propagate multi-hop DAG reachability
     for (let s = 0; s < sccCnt; s++) {
       for (let u = 0; u < P; u++) {
         if (scc[u] !== s) continue;
@@ -1357,8 +1593,45 @@ export class PortalGraph {
       }
     }
   }
+  //#endregion
 
-  /** #G4: Records agent traversal across a portal to throttle overcrowded bottlenecks */
+  //#region 20: PortalGraph Super-Chunk Hierarchy & Dynamic Traffic Weights (#B1, #I4)
+  /**
+   * #I4: Builds the Two-Level 64x64 Super-Chunk Hierarchy (`SUPER_STEP = 4` chunks per axis).
+   * Records super-chunk membership for every chunk and builds the coarse super-chunk adjacency graph.
+   */
+  _buildSuperChunkHierarchy() {
+    const { grid, portals } = this;
+    const scx = this.scx = Math.ceil(grid.cx / SUPER_STEP);
+    const scy = this.scy = Math.ceil(grid.cy / SUPER_STEP);
+    this.superLayerCount = scx * scy;
+    const S = this.superChunkCount = this.superLayerCount * grid.layers;
+    const chunkToSuper = this.chunkToSuper = new Int32Array(grid.chunkCount);
+
+    for (let c = 0; c < grid.chunkCount; c++) {
+      const z = grid.chunkLayer(c), rem = c % grid.layerChunks;
+      const cx = rem % grid.cx, cy = (rem / grid.cx) | 0;
+      chunkToSuper[c] = z * this.superLayerCount + ((cy / SUPER_STEP) | 0) * scx + ((cx / SUPER_STEP) | 0);
+    }
+
+    const sAdj = Array.from({ length: S }, () => new Map());
+    for (let i = 0; i < portals.length; i++) {
+      const p = portals[i];
+      const sA = chunkToSuper[p.chunkA], sB = chunkToSuper[p.chunkB];
+      if (sA === sB) continue;
+      const w = (SUPER_STEP * CS) * 0.5;
+      if (p.canAB !== false) {
+        const prev = sAdj[sA].get(sB);
+        if (prev === undefined || w < prev) sAdj[sA].set(sB, w);
+      }
+      if (p.canBA !== false) {
+        const prev = sAdj[sB].get(sA);
+        if (prev === undefined || w < prev) sAdj[sB].set(sA, w);
+      }
+    }
+    this.superAdj = sAdj;
+  }
+
   addPortalTraffic(portalId, amount = 1.0) {
     if (portalId < 0 || portalId >= this.portals.length) return;
     const p = this.portals[portalId], cap = Math.max(1, p.cellsA.length);
@@ -1370,7 +1643,6 @@ export class PortalGraph {
     }
   }
 
-  /** #G4: Decays real-time portal traffic congestion surcharges */
   decayPortalTraffic(decayFactor = 0.85, eps = 0.02) {
     const T = this.portalTraffic, P = T.length;
     let changed = false;
@@ -1391,8 +1663,8 @@ export class PortalGraph {
   }
 
   refreshWeights(dirtyChunks) {
-    const { grid, portals, chunkPortals, minClearance, profile, _it: it, _field: field } = this;
-    const itOpts = { minClearance, profile };
+    const { grid, portals, chunkPortals, minClearance, profile, footprint, _it: it, _field: field } = this;
+    const itOpts = { minClearance, profile, footprint };
     for (const c of dirtyChunks) {
       const ids = chunkPortals[c];
       if (!ids || ids.length < 2) continue;
@@ -1419,14 +1691,15 @@ export class PortalGraph {
     }
     this.weightVersion++;
   }
+  //#endregion
 }
-//#endregion
 
-//#region 15: Hierarchical Macro Pathfinder, SSFA Funnel & Swarm Broadcast (#B3, #F5)
 /**
- * Hierarchical A*, Funnel String-Puller (#F5) & Swarm Broadcast Pathfinder (#B3) operating over `PortalGraph`.
+ * Hierarchical A*, Two-Level Super-Chunk Corridor Pruner (#I4), Funnel String-Puller (#F5)
+ * & Swarm Broadcast Pathfinder (#B3) operating over `PortalGraph`.
  */
 export class MacroPathfinder {
+  //#region 21: MacroPathfinder Goal Creation & Multi-Goal Seeding
   constructor(grid, graph, goalCacheCap = 256) {
     this.grid = grid; this.graph = graph;
     this.goalCacheCap = goalCacheCap;
@@ -1437,6 +1710,7 @@ export class MacroPathfinder {
     this.closed = new Uint32Array(N); this.it = new ChunkIntegrator();
     this.startField = new Float32Array(CC); this.heap = new MinHeap(256); this.stamp = 0;
     this._swarmIdCounter = 1;
+    this._superMask = new Uint8Array(graph.superChunkCount);
   }
 
   invalidateChunks(dirtyChunks) {
@@ -1446,11 +1720,14 @@ export class MacroPathfinder {
   }
 
   createGoal(cell) {
-    const { grid, graph } = this, x = cell % grid.width, y = cell / grid.width | 0;
-    const chunk = grid.chunkIdAt(x, y), field = new Float32Array(CC);
+    const { grid, graph } = this;
+    const z = (cell / grid.layerCells) | 0, rem = cell % grid.layerCells;
+    const x = rem % grid.width, y = (rem / grid.width) | 0;
+    const chunk = grid.chunkIdAt(x, y, z), field = new Float32Array(CC);
     this.it.integrate(grid, chunk, [grid.localIndex(cell)], field, {
       minClearance: graph.minClearance,
-      profile: graph.profile
+      profile: graph.profile,
+      footprint: graph.footprint
     });
     const portalCost = new Float32Array(graph.portals.length).fill(Infinity);
     const cPortals = graph.chunkPortals[chunk];
@@ -1467,7 +1744,7 @@ export class MacroPathfinder {
         else sccMaskHi |= (1 << (bit - 32));
       }
     }
-    return { isMulti: false, cell, x, y, chunk, field, portalCost, compSet, sccMaskLo, sccMaskHi, graph };
+    return { isMulti: false, cell, x, y, layer: z, chunk, field, portalCost, compSet, sccMaskLo, sccMaskHi, graph };
   }
 
   createMultiGoal(targets) {
@@ -1481,11 +1758,12 @@ export class MacroPathfinder {
 
     for (let i = 0; i < targets.length; i++) {
       const t = targets[i];
-      const cell = typeof t === 'object' ? (t.cell ?? grid.index(t.x | 0, t.y | 0)) : t;
+      const cell = typeof t === 'object' ? (t.cell ?? grid.index(t.x | 0, t.y | 0, t.layer ?? 0)) : t;
       const weight = typeof t === 'object' ? (t.weight ?? 0) : 0;
-      if (cell < 0 || cell >= grid.width * grid.height) continue;
-      const x = cell % grid.width, y = (cell / grid.width) | 0, chunk = grid.chunkIdAt(x, y);
-      goalList.push({ cell, x, y, chunk, weight });
+      if (cell < 0 || cell >= grid.layerCells * grid.layers) continue;
+      const z = (cell / grid.layerCells) | 0, rem = cell % grid.layerCells;
+      const x = rem % grid.width, y = (rem / grid.width) | 0, chunk = grid.chunkIdAt(x, y, z);
+      goalList.push({ cell, x, y, layer: z, chunk, weight });
       if (!chunkGroups.has(chunk)) chunkGroups.set(chunk, []);
       chunkGroups.get(chunk).push({ cell: grid.localIndex(cell), weight, globalCell: cell });
     }
@@ -1498,6 +1776,7 @@ export class MacroPathfinder {
       this.it.integrate(grid, chunk, seeded, field, {
         minClearance: graph.minClearance,
         profile: graph.profile,
+        footprint: graph.footprint,
         sourceOut
       });
       chunkFields.set(chunk, { field, sourceOut, sources });
@@ -1516,12 +1795,13 @@ export class MacroPathfinder {
       }
     }
 
-    const primary = goalList[0] || { cell: 0, x: 0, y: 0, chunk: 0 };
+    const primary = goalList[0] || { cell: 0, x: 0, y: 0, layer: 0, chunk: 0 };
     return {
       isMulti: true,
       cell: primary.cell,
       x: primary.x,
       y: primary.y,
+      layer: primary.layer,
       chunk: primary.chunk,
       goals: goalList,
       chunkFields,
@@ -1544,11 +1824,56 @@ export class MacroPathfinder {
     this.goalCache.set(cell, g);
     return g;
   }
+  //#endregion
 
+  //#region 22: MacroPathfinder Super-Chunk Corridor Pruner & Portal Funnel (#F5, #I4)
   /**
-   * #F5: Runs the 2D Simple Stupid Funnel Algorithm (SSFA) across `portals` to compute
-   * per-chunk string-pulled visibility targets (`funnelX`, `funnelY`) for cross-chunk corner cutting.
+   * #I4: Computes a dilated 64x64 Super-Chunk corridor mask between `startSuper` and `goalSuper`
+   * to prune long-range A* portal expansions on large maps.
    */
+  _computeSuperCorridorMask(startSuper, goalSuper) {
+    const { graph, _superMask: mask } = this;
+    const S = graph.superChunkCount, scx = graph.scx, scy = graph.scy, sLC = graph.superLayerCount;
+    mask.fill(0);
+    const dist = new Float32Array(S).fill(Infinity);
+    const parent = new Int32Array(S).fill(-1);
+    const heap = this.heap;
+    heap.clear();
+    dist[startSuper] = 0;
+    heap.push(startSuper, 0);
+
+    const gRem = goalSuper % sLC, gx = gRem % scx, gy = (gRem / scx) | 0;
+    while (!heap.isEmpty) {
+      const u = heap.pop();
+      if (u === goalSuper) break;
+      const du = dist[u];
+      for (const [v, w] of graph.superAdj[u]) {
+        const nd = du + w;
+        if (nd < dist[v]) {
+          dist[v] = nd;
+          parent[v] = u;
+          const vRem = v % sLC, vx = vRem % scx, vy = (vRem / scx) | 0;
+          heap.push(v, nd + octile(vx - gx, vy - gy) * (SUPER_STEP * CS * 0.5));
+        }
+      }
+    }
+    if (dist[goalSuper] === Infinity) return null;
+
+    // Mark optimal super-chunk chain + 1-super-chunk halo dilation for smooth cornering
+    for (let cur = goalSuper; cur !== -1; cur = parent[cur]) {
+      const z = (cur / sLC) | 0, rem = cur % sLC, x = rem % scx, y = (rem / scx) | 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx >= 0 && nx < scx && ny >= 0 && ny < scy) {
+            mask[z * sLC + ny * scx + nx] = 1;
+          }
+        }
+      }
+    }
+    return mask;
+  }
+
   _computePortalFunnel(portals, chunks, sx, sy, gx, gy) {
     const P = portals.length, C = chunks.length;
     const funnelX = new Float32Array(C), funnelY = new Float32Array(C);
@@ -1561,6 +1886,10 @@ export class MacroPathfinder {
 
     for (let i = 0; i < P; i++) {
       const p = gPortals[portals[i]], fromChunk = chunks[i];
+      if (p.isVertical) {
+        lx[i] = rx[i] = p.anchorX; ly[i] = ry[i] = p.anchorY;
+        continue;
+      }
       const x0 = p.isH ? p.start : p.border, y0 = p.isH ? p.border : p.start;
       const x1 = p.isH ? p.end + 1 : p.border, y1 = p.isH ? p.border : p.end + 1;
       const pos = fromChunk === p.chunkA;
@@ -1608,28 +1937,30 @@ export class MacroPathfinder {
     }
     while (stepWrite < P) {
       const p = gPortals[portals[stepWrite]];
-      funnelX[stepWrite] = clamp(gx, p.isH ? p.start + 0.5 : p.border, p.isH ? p.end + 0.5 : p.border);
-      funnelY[stepWrite] = clamp(gy, p.isH ? p.border : p.start + 0.5, p.isH ? p.border : p.end + 0.5);
+      funnelX[stepWrite] = p.isVertical ? p.anchorX : clamp(gx, p.isH ? p.start + 0.5 : p.border, p.isH ? p.end + 0.5 : p.border);
+      funnelY[stepWrite] = p.isVertical ? p.anchorY : clamp(gy, p.isH ? p.border : p.start + 0.5, p.isH ? p.border : p.end + 0.5);
       stepWrite++;
     }
     return { funnelX, funnelY };
   }
+  //#endregion
 
-  findPath(startCell, goalOrCell) {
+  //#region 23: MacroPathfinder Hierarchical A* & Swarm Broadcast Solver (#B3, #I4)
+  findPath(startCell, goalOrCell, useSuperCorridor = true) {
     const goal = typeof goalOrCell === 'number'
       ? this.getOrCreateGoal(goalOrCell)
       : (Array.isArray(goalOrCell) ? this.createMultiGoal(goalOrCell) : goalOrCell);
     if (!goal) return null;
     const { grid, graph, g, parent, parentChunk, seen, closed, heap } = this;
     const P = graph.portals.length, START = P, GOAL = P + 1;
-    if (++this.stamp >= 0xffffffff) { seen.fill(0); closed.fill(0); this.stamp = 1; }
-    const s = this.stamp;
-    const sx = startCell % grid.width, sy = startCell / grid.width | 0, sc = grid.chunkIdAt(sx, sy);
+    const sz = (startCell / grid.layerCells) | 0, sRem = startCell % grid.layerCells;
+    const sx = sRem % grid.width, sy = (sRem / grid.width) | 0, sc = grid.chunkIdAt(sx, sy, sz);
     const gx = goal.x + 0.5, gy = goal.y + 0.5;
 
     this.it.integrate(grid, sc, [grid.localIndex(startCell)], this.startField, {
       minClearance: graph.minClearance,
       profile: graph.profile,
+      footprint: graph.footprint,
       forward: true
     });
 
@@ -1649,7 +1980,6 @@ export class MacroPathfinder {
         if (this.startField[pLocal(grid, p, sc)] < Infinity && crossingCost(grid, p, sc, graph.profile) < Infinity) {
           if (!goal.compSet.has(graph.portalComp[pid])) continue;
           const uScc = graph.portalScc[pid];
-          // #H2: O(1) Directed SCC DAG reachability bitmask check
           if (((graph.sccReachLo[uScc] & gLo) !== 0) || ((graph.sccReachHi[uScc] & gHi) !== 0)) {
             reachableMatch = true;
             break;
@@ -1659,89 +1989,110 @@ export class MacroPathfinder {
       if (!reachableMatch) return null;
     }
 
-    const heuristic = (px, py) => {
-      if (!goal.isMulti) return Math.max(0, octile(px - gx, py - gy) - 0.5);
-      let best = Infinity;
-      for (let i = 0; i < goal.goals.length; i++) {
-        const tg = goal.goals[i];
-        const d = Math.max(0, octile(px - (tg.x + 0.5), py - (tg.y + 0.5)) - 0.5) + tg.weight;
-        if (d < best) best = d;
-      }
-      return best;
-    };
-
-    heap.clear(); g[START] = 0; seen[START] = s; parent[START] = -1; parentChunk[START] = sc;
-    heap.push(START, heuristic(sx + 0.5, sy + 0.5));
-
-    let chosenGoalCell = goal.cell;
-    const relax = (v, cost, from, chunk, resolvedCell = -1) => {
-      if (closed[v] === s || (seen[v] === s && cost >= g[v])) return;
-      seen[v] = s; g[v] = cost; parent[v] = from; parentChunk[v] = chunk;
-      if (v === GOAL && resolvedCell >= 0) chosenGoalCell = resolvedCell;
-      const h = v < P ? heuristic(graph.portals[v].anchorX, graph.portals[v].anchorY) : 0;
-      heap.push(v, cost + h);
-    };
-
-    while (!heap.isEmpty) {
-      const u = heap.pop();
-      if (closed[u] === s) continue;
-      closed[u] = s;
-      if (u === GOAL) {
-        const portals = [], chunks = [parentChunk[GOAL]];
-        let n = parent[GOAL];
-        while (n !== START) { portals.push(n); chunks.push(parentChunk[n]); n = parent[n]; }
-        const pArr = new Int32Array(portals.reverse());
-        const cArr = new Int32Array(chunks.reverse());
-        const fgx = (chosenGoalCell % grid.width) + 0.5, fgy = ((chosenGoalCell / grid.width) | 0) + 0.5;
-        const { funnelX, funnelY } = this._computePortalFunnel(pArr, cArr, sx + 0.5, sy + 0.5, fgx, fgy);
-        return {
-          portals: pArr,
-          chunks: cArr,
-          funnelX,
-          funnelY,
-          cost: g[GOAL],
-          goalCell: chosenGoalCell,
-          goalX: fgx,
-          goalY: fgy,
-          minClearance: graph.minClearance,
-          profile: graph.profile,
-          graph
-        };
-      }
-      const gu = g[u];
-      if (u === START) {
-        for (let i = 0; i < cPorts.length; i++) {
-          const pid = cPorts[i], p = graph.portals[pid];
-          const d = graph._samplePortalRowDist(this.startField, p, sc);
-          const cross = crossingCost(grid, p, sc, graph.profile);
-          if (d < Infinity && cross < Infinity) relax(pid, gu + d + cross, START, sc);
-        }
-        if (!goal.isMulti && sc === goal.chunk) {
-          const d = goal.field[grid.localIndex(startCell)];
-          if (d < Infinity) relax(GOAL, gu + d, START, sc, goal.cell);
-        } else if (goal.isMulti && goal.chunkFields.has(sc)) {
-          const cf = goal.chunkFields.get(sc), loc = grid.localIndex(startCell);
-          const d = cf.field[loc];
-          if (d < Infinity) relax(GOAL, gu + d, START, sc, cf.sourceOut[loc]);
-        }
-      } else {
-        for (let e = graph.edgeOffsets[u]; e < graph.edgeOffsets[u + 1]; e++) {
-          relax(graph.edgeTargets[e], gu + graph.edgeCosts[e], u, graph.edgeChunks[e]);
-        }
-        const gc = goal.portalCost[u];
-        if (gc < Infinity) {
-          const rCell = goal.isMulti ? goal.portalGoalCell[u] : goal.cell;
-          const rChunk = grid.chunkIdAt(rCell % grid.width, (rCell / grid.width) | 0);
-          relax(GOAL, gu + gc, u, rChunk, rCell);
-        }
+    // #I4: Use Super-Chunk corridor pruning when start and single goal are far apart (> 2 super-chunks)
+    let superMask = null;
+    if (useSuperCorridor && !sameChunkDirect && !goal.isMulti && graph.superChunkCount >= 9) {
+      const sSuper = graph.chunkToSuper[sc], gSuper = graph.chunkToSuper[goal.chunk];
+      const sDist = Math.abs((sSuper % graph.scx) - (gSuper % graph.scx)) + Math.abs(((sSuper / graph.scx) | 0) - ((gSuper / graph.scx) | 0));
+      if (sDist >= 3) {
+        superMask = this._computeSuperCorridorMask(sSuper, gSuper);
       }
     }
-    return null;
+
+    const runSearch = (corridorMask) => {
+      if (++this.stamp >= 0xffffffff) { seen.fill(0); closed.fill(0); this.stamp = 1; }
+      const s = this.stamp;
+
+      const heuristic = (px, py) => {
+        if (!goal.isMulti) return Math.max(0, octile(px - gx, py - gy) - 0.5);
+        let best = Infinity;
+        for (let i = 0; i < goal.goals.length; i++) {
+          const tg = goal.goals[i];
+          const d = Math.max(0, octile(px - (tg.x + 0.5), py - (tg.y + 0.5)) - 0.5) + tg.weight;
+          if (d < best) best = d;
+        }
+        return best;
+      };
+
+      heap.clear(); g[START] = 0; seen[START] = s; parent[START] = -1; parentChunk[START] = sc;
+      heap.push(START, heuristic(sx + 0.5, sy + 0.5));
+
+      let chosenGoalCell = goal.cell;
+      const relax = (v, cost, from, chunk, resolvedCell = -1) => {
+        if (corridorMask && v < P && !corridorMask[graph.chunkToSuper[chunk]]) return;
+        if (closed[v] === s || (seen[v] === s && cost >= g[v])) return;
+        seen[v] = s; g[v] = cost; parent[v] = from; parentChunk[v] = chunk;
+        if (v === GOAL && resolvedCell >= 0) chosenGoalCell = resolvedCell;
+        const h = v < P ? heuristic(graph.portals[v].anchorX, graph.portals[v].anchorY) : 0;
+        heap.push(v, cost + h);
+      };
+
+      while (!heap.isEmpty) {
+        const u = heap.pop();
+        if (closed[u] === s) continue;
+        closed[u] = s;
+        if (u === GOAL) {
+          const portals = [], chunks = [parentChunk[GOAL]];
+          let n = parent[GOAL];
+          while (n !== START) { portals.push(n); chunks.push(parentChunk[n]); n = parent[n]; }
+          const pArr = new Int32Array(portals.reverse());
+          const cArr = new Int32Array(chunks.reverse());
+          const fz = (chosenGoalCell / grid.layerCells) | 0, fRem = chosenGoalCell % grid.layerCells;
+          const fgx = (fRem % grid.width) + 0.5, fgy = ((fRem / grid.width) | 0) + 0.5;
+          const { funnelX, funnelY } = this._computePortalFunnel(pArr, cArr, sx + 0.5, sy + 0.5, fgx, fgy);
+          return {
+            portals: pArr,
+            chunks: cArr,
+            funnelX,
+            funnelY,
+            cost: g[GOAL],
+            goalCell: chosenGoalCell,
+            goalX: fgx,
+            goalY: fgy,
+            goalLayer: fz,
+            minClearance: graph.minClearance,
+            profile: graph.profile,
+            footprint: graph.footprint,
+            graph
+          };
+        }
+        const gu = g[u];
+        if (u === START) {
+          for (let i = 0; i < cPorts.length; i++) {
+            const pid = cPorts[i], p = graph.portals[pid];
+            const d = graph._samplePortalRowDist(this.startField, p, sc);
+            const cross = crossingCost(grid, p, sc, graph.profile);
+            if (d < Infinity && cross < Infinity) relax(pid, gu + d + cross, START, sc);
+          }
+          if (!goal.isMulti && sc === goal.chunk) {
+            const d = goal.field[grid.localIndex(startCell)];
+            if (d < Infinity) relax(GOAL, gu + d, START, sc, goal.cell);
+          } else if (goal.isMulti && goal.chunkFields.has(sc)) {
+            const cf = goal.chunkFields.get(sc), loc = grid.localIndex(startCell);
+            const d = cf.field[loc];
+            if (d < Infinity) relax(GOAL, gu + d, START, sc, cf.sourceOut[loc]);
+          }
+        } else {
+          for (let e = graph.edgeOffsets[u]; e < graph.edgeOffsets[u + 1]; e++) {
+            relax(graph.edgeTargets[e], gu + graph.edgeCosts[e], u, graph.edgeChunks[e]);
+          }
+          const gc = goal.portalCost[u];
+          if (gc < Infinity) {
+            const rCell = goal.isMulti ? goal.portalGoalCell[u] : goal.cell;
+            const rz = (rCell / grid.layerCells) | 0, rRem = rCell % grid.layerCells;
+            const rChunk = grid.chunkIdAt(rRem % grid.width, (rRem / grid.width) | 0, rz);
+            relax(GOAL, gu + gc, u, rChunk, rCell);
+          }
+        }
+      }
+      return null;
+    };
+
+    const res = runSearch(superMask);
+    // Fallback to unconstrained search if dilated super-corridor was blocked by an internal maze
+    return (res || !superMask) ? res : runSearch(null);
   }
 
-  /**
-   * #B3: Builds a Global Reverse-Dijkstra Swarm Broadcast Field over `PortalGraph` in O(E log P).
-   */
   createSwarmField(targets) {
     const goal = Array.isArray(targets) ? this.createMultiGoal(targets) : this.getOrCreateGoal(targets);
     const { graph, heap } = this;
@@ -1786,19 +2137,21 @@ export class MacroPathfinder {
       goal,
       goalX: goal.x + 0.5,
       goalY: goal.y + 0.5,
+      goalLayer: goal.layer ?? 0,
       portalDist,
       portalNext,
       goalChunks,
       minClearance: graph.minClearance,
       profile: graph.profile,
+      footprint: graph.footprint,
       weightVersion: graph.weightVersion,
       graph
     };
   }
+  //#endregion
 }
-//#endregion
 
-//#region 16: Chunk Line-of-Sight & Flow Vector Extraction (#3, #4, #7, #A1, #F2)
+//#region 24: Chunk Supercover LOS & Flow Vector Gradient Extraction (#3, #A1, #F2)
 /**
  * #3: Fast chunk-local supercover Line-of-Sight check.
  */
@@ -1916,7 +2269,7 @@ export function computeFlowVectors(f, exX, exY, opts = {}) {
 }
 //#endregion
 
-//#region 17: Geodesic Guide-Curve & Spline Corridor Builder (#10, #D2, #F4)
+//#region 25: Multi-Chunk Geodesic Corridor & Spline Flow Field Builder (#10, #D2, #F4)
 /**
  * #10, #D2 & #F4: Multi-Chunk Geodesic Guide-Curve / Spline Corridor Flow Field builder.
  * Propagates corridor distances through `PortalGraph` when the spline lies in neighboring chunks
@@ -2018,11 +2371,11 @@ export function buildCorridorField(grid, chunkId, polyline, opts = {}) {
 }
 //#endregion
 
-//#region 18: LRU Flow Field Cache & Cross-Boundary Seeding (#A1, #B4, #F1, #F2, #F4, #F5)
 /**
  * #A1, #B4, #F1, #F2, #F4, #F5: Collision-proof LRU cache of per-chunk flow fields backed by `FieldBufferPool`.
  */
 export class FlowFieldCache {
+  //#region 26: FlowFieldCache Core LRU & Collision-Proof Hashing (#B4, #F1)
   constructor(grid, cap = 2048) {
     this.grid = grid;
     this.cap = cap;
@@ -2090,7 +2443,9 @@ export class FlowFieldCache {
       _pooled: false
     };
   }
+  //#endregion
 
+  //#region 27: FlowFieldCache Portal, Goal, Swarm & Multi-Goal Builders (#A1, #B3, #F2, #F5)
   /**
    * #A1 & #F5: Portal field with Cross-Boundary Wavefront Seeding and optional Funnel Target LOS.
    */
@@ -2253,7 +2608,9 @@ export class FlowFieldCache {
     this._tag(f, c, 'm', h, minClearance, 0, profile);
     return this._store(k, f);
   }
+  //#endregion
 
+  //#region 28: FlowFieldCache Vortex, Flee, Corridor & Invalidation Builders (#7, #8, #B4, #F4)
   /**
    * #7, #B4 & #F4: Cached Vortex / Orbit field using `PortalGraph` geodesic seeding for cross-chunk centers.
    */
@@ -2429,10 +2786,10 @@ export class FlowFieldCache {
     });
     return this._store(k, f);
   }
+  //#endregion
 }
-//#endregion
 
-//#region 19: Bilinear Flow Vector Sampler (#A3)
+//#region 29: Bilinear Flow Field Sampler (#A3)
 /**
  * #A3: Bilinearly interpolates the flow direction vector `(out.x, out.y)` at world position `(px, py)`.
  */
@@ -2484,7 +2841,7 @@ export function sampleFlowBilinear(f, px, py, out = { x: 0, y: 0 }, neighborReso
 }
 //#endregion
 
-//#region 20: SoA Crowd Steering Simulator, RVO-Lite & Settling (#C2, #G1, #G2, #G4)
+//#region 30: Agent State Constants (#G2)
 /** Agent state constants for `CrowdSystem` (#G2) */
 export const AGENT_STATE = Object.freeze({
   IDLE: 0,
@@ -2492,6 +2849,7 @@ export const AGENT_STATE = Object.freeze({
   ARRIVING: 2,
   SETTLED: 3
 });
+//#endregion
 
 /**
  * #C2, #G1, #G2, #G4: Structure-of-Arrays (SoA) Crowd Steering Simulator featuring:
@@ -2500,6 +2858,7 @@ export const AGENT_STATE = Object.freeze({
  * - #G4: Automatic portal crossing traffic recording for Wardrop load-balancing
  */
 export class CrowdSystem {
+  //#region 31: CrowdSystem SoA Allocation & Agent Lifecycle (#C2)
   constructor(pathfinder, capacity = 4096, opts = {}) {
     this.pf = pathfinder;
     this.cap = capacity;
@@ -2587,7 +2946,9 @@ export class CrowdSystem {
       this.targets[id] = null;
     }
   }
+  //#endregion
 
+  //#region 32: CrowdSystem RVO-Lite, Contagious Settling & Step Simulation (#G1, #G2, #G4)
   step(dt = 1 / 60) {
     const {
       pf, count, px, py, vx, vy, radius, speed, hintIdx, active, state,
@@ -2773,16 +3134,16 @@ export class CrowdSystem {
       px[i] = nx; py[i] = ny;
     }
   }
+  //#endregion
 }
-//#endregion
 
-//#region 21: Hierarchical Squad & Formation Controller (#G3)
 /**
  * #G3: Hierarchical Squad & Formation Controller (`SquadSystem`).
  * Manages virtual squad leaders, rubber-banded leader speed throttling when squad members lag in bottlenecks,
  * and formation slot presets (`'line'`, `'column'`, `'wedge'`, `'box'`, `'circle'`).
  */
 export class SquadSystem {
+  //#region 33: SquadSystem Formation Slot Generator & Squad Management (#G3)
   constructor(pathfinder, crowd = null) {
     this.pf = pathfinder;
     this.crowd = crowd || pathfinder.createCrowd();
@@ -2854,7 +3215,9 @@ export class SquadSystem {
     sq.path = pathOrSwarm;
     sq.leaderHintIdx = 0;
   }
+  //#endregion
 
+  //#region 34: SquadSystem Rubber-Banded Leader & Formation Step (#C4, #G3)
   step(dt = 1 / 60) {
     const { pf, crowd, _vec } = this;
     for (const sq of this.squads.values()) {
@@ -2906,5 +3269,648 @@ export class SquadSystem {
       }
     }
   }
+  //#endregion
+}
+
+//#region 35: Async Web Worker & SharedArrayBuffer Pipeline (#I3)
+/**
+ * #I3: Web Worker + `SharedArrayBuffer` Lock-Free Async Pipeline.
+ * Offloads graph rebuilds, pathfinding, and swarm field generation to a background Web Worker
+ * operating directly over shared memory (with automatic inline fallback if Workers are unavailable).
+ */
+export class AsyncPathfinderPipeline {
+  constructor(pathfinder, workerUrl = null) {
+    this.pf = pathfinder;
+    this.worker = null;
+    this._reqId = 1;
+    this._pending = new Map();
+
+    if (typeof Worker !== 'undefined' && (workerUrl || typeof import.meta !== 'undefined')) {
+      try {
+        const modUrl = workerUrl || import.meta.url;
+        const src = `
+          import { GridWorld, PortalGraph, MacroPathfinder } from ${JSON.stringify(modUrl)};
+          let grid = null, graphs = new Map();
+          const getHier = (clr = 1, prof = null, fp = null) => {
+            const key = JSON.stringify([clr, prof, fp]);
+            let h = graphs.get(key);
+            if (!h) {
+              const graph = new PortalGraph(grid, null, null, clr, prof, fp);
+              const macro = new MacroPathfinder(grid, graph);
+              h = { graph, macro };
+              graphs.set(key, h);
+            }
+            return h;
+          };
+          self.onmessage = (e) => {
+            const { id, cmd, payload } = e.data;
+            if (cmd === 'init') {
+              grid = GridWorld.fromSharedDescriptor(payload);
+              self.postMessage({ id, ok: true });
+            } else if (cmd === 'rebuild') {
+              if (payload.dirty) {
+                for (const c of payload.dirty) grid.dirtyChunks.add(c);
+              }
+              const all = grid.consumeDirtyChunks();
+              for (const [k, h] of graphs) {
+                const nextG = new PortalGraph(grid, h.graph, all, h.graph.minClearance, h.graph.profile, h.graph.footprint);
+                graphs.set(k, { graph: nextG, macro: new MacroPathfinder(grid, nextG) });
+              }
+              self.postMessage({ id, ok: true });
+            } else if (cmd === 'findPath') {
+              const { startCell, goalCell, clr, prof, fp } = payload;
+              const { macro } = getHier(clr, prof, fp);
+              const p = macro.findPath(startCell, goalCell);
+              self.postMessage({
+                id,
+                path: p ? {
+                  portals: p.portals, chunks: p.chunks, funnelX: p.funnelX, funnelY: p.funnelY,
+                  cost: p.cost, goalCell: p.goalCell, goalX: p.goalX, goalY: p.goalY,
+                  goalLayer: p.goalLayer, minClearance: p.minClearance, profile: p.profile
+                } : null
+              });
+            }
+          };
+        `;
+        const blob = new Blob([src], { type: 'application/javascript' });
+        this.worker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+        this.worker.onmessage = (e) => {
+          const { id, ...data } = e.data;
+          const res = this._pending.get(id);
+          if (res) { this._pending.delete(id); res(data); }
+        };
+        this._send('init', this.pf.grid.toSharedDescriptor());
+      } catch (_) {
+        this.worker = null;
+      }
+    }
+  }
+
+  _send(cmd, payload) {
+    if (!this.worker) return Promise.resolve(null);
+    const id = this._reqId++;
+    return new Promise(resolve => {
+      this._pending.set(id, resolve);
+      this.worker.postMessage({ id, cmd, payload });
+    });
+  }
+
+  async rebuildAsync() {
+    const dirty = Array.from(this.pf.grid.dirtyChunks);
+    this.pf.rebuild();
+    if (this.worker) await this._send('rebuild', { dirty });
+    return true;
+  }
+
+  async findPathAsync(sx, sy, gx, gy, opts = {}) {
+    if (!this.worker) return this.pf.findPath(sx, sy, gx, gy, opts);
+    const { grid } = this.pf;
+    const clr = opts.minClearance ?? this.pf.minClearance;
+    const prof = opts.profile ?? null;
+    const fp = opts.footprint ?? null;
+    const sz = opts.startLayer ?? opts.layer ?? 0, gz = opts.goalLayer ?? opts.layer ?? 0;
+    const scx = clamp(sx | 0, 0, grid.width - 1), scy = clamp(sy | 0, 0, grid.height - 1);
+    const gcx = clamp(gx | 0, 0, grid.width - 1), gcy = clamp(gy | 0, 0, grid.height - 1);
+    const startCell = grid.isWalkable(scx, scy, clr, prof, sz, fp) ? grid.index(scx, scy, sz) : grid.findNearestWalkable(scx, scy, 16, clr, prof, sz, fp);
+    const goalCell = grid.isWalkable(gcx, gcy, clr, prof, gz, fp) ? grid.index(gcx, gcy, gz) : grid.findNearestWalkable(gcx, gcy, 16, clr, prof, gz, fp);
+    if (startCell < 0 || goalCell < 0) return null;
+
+    const { graph } = this.pf._getHierarchy(clr, prof, fp);
+    const res = await this._send('findPath', { startCell, goalCell, clr, prof, fp });
+    if (res && res.path) {
+      res.path.graph = graph;
+      res.path.footprint = fp;
+      return res.path;
+    }
+    return null;
+  }
+
+  terminate() {
+    if (this.worker) {
+      this.worker.terminate();
+      this.worker = null;
+    }
+    this._pending.clear();
+  }
 }
 //#endregion
+
+/**
+ * Unified Hierarchical Flow Field Pathfinding API (v3.0) exposing all flow field types,
+ * Multi-Floor 2.5D Stacked Grids (#H3), Anisotropic Rectangular Vehicle Footprints (#H4),
+ * Web Worker + SharedArrayBuffer Async Pipeline (#I3), and Two-Level 64x64 Super-Chunks (#I4).
+ */
+export class FlowFieldPathfinder {
+  //#region 36: FlowFieldPathfinder Initialization & World Mutator Delegates (#C3, #D4, #E1, #H3)
+  constructor(opts = {}) {
+    const cx = opts.width ? Math.ceil(opts.width / CS) : (opts.chunksX ?? 10);
+    const cy = opts.height ? Math.ceil(opts.height / CS) : (opts.chunksY ?? 10);
+    this.cacheCap = opts.cacheCap ?? 2048;
+    this.minClearance = opts.minClearance ?? 1;
+    this.portalLookahead = opts.portalLookahead ?? true;
+    this.seamInterpolation = opts.seamInterpolation ?? true;
+    this.useSuperChunks = opts.useSuperChunks ?? true;
+
+    this.grid = new GridWorld(cx, cy, opts.costs || null, {
+      layers: opts.layers ?? 1,
+      shared: opts.shared ?? false
+    });
+    if (opts.useEikonal !== undefined) this.grid.useEikonal = opts.useEikonal;
+    if (opts.losSmoothing !== undefined) this.grid.losSmoothing = opts.losSmoothing;
+    if (opts.wallRepulsion) this.grid.enableWallRepulsion(opts.wallRepulsion);
+
+    this.graph = new PortalGraph(this.grid, null, null, this.minClearance, null, null);
+    this.macro = new MacroPathfinder(this.grid, this.graph);
+    this.cache = new FlowFieldCache(this.grid, this.cacheCap);
+    this.clearanceGraphs = new Map([[this._hierarchyKey(this.minClearance, null, null), { graph: this.graph, macro: this.macro }]]);
+    this._workQueue = [];
+    this._tmpVec = { x: 0, y: 0 };
+  }
+
+  get width() { return this.grid.width; }
+  get height() { return this.grid.height; }
+  get layers() { return this.grid.layers; }
+
+  _hierarchyKey(minClearance, profile = null, footprint = null) {
+    if (!profile && !footprint) return minClearance;
+    const fpKey = footprint ? `${footprint.width ?? 1}x${footprint.length ?? 1}:${footprint.turnPenalty ?? 2}` : '';
+    return `${minClearance}:${this.grid.getProfileId(profile)}:${fpKey}`;
+  }
+
+  getCost(x, y, z = 0) { return this.grid.getCost(x, y, z); }
+  setCost(x, y, cost, z = 0) { return this.grid.setCost(x, y, cost, z); }
+  setRect(x, y, w, h, cost, z = 0) { return this.grid.setRect(x, y, w, h, cost, z); }
+  setDisc(x, y, r, cost, z = 0) { return this.grid.setDisc(x, y, r, cost, z); }
+  loadCosts(costs, layer = null) { this.grid.loadCosts(costs, layer); }
+
+  // #H3: 2.5D Stair / Ramp / Overpass Portal registration
+  addStairPortal(x, y, w = 2, h = 2, fromLayer = 0, toLayer = 1, opts = {}) {
+    return this.grid.addStairPortal(x, y, w, h, fromLayer, toLayer, opts);
+  }
+
+  // #D4: Terrain & Profile API delegates
+  registerProfile(name, costMapOrArray) { return this.grid.registerProfile(name, costMapOrArray); }
+  setTerrain(x, y, terrainId, z = 0) { return this.grid.setTerrain(x, y, terrainId, z); }
+  setRectTerrain(x, y, w, h, terrainId, z = 0) { return this.grid.setRectTerrain(x, y, w, h, terrainId, z); }
+
+  // #C3: Dynamic Moving Obstacle API delegates
+  stampDynamicObstacle(wx, wy, r, blocked = 1, z = 0) { this.grid.stampDynamicObstacle(wx, wy, r, blocked, z); }
+  clearDynamicObstacles() { this.grid.clearDynamicObstacles(); }
+
+  // #E1: World Raycast & Tactical FOV Shadowcasting delegates
+  raycast(x0, y0, x1, y1, opts = {}) { return this.grid.raycast(x0, y0, x1, y1, opts); }
+  addTacticalFOV(wx, wy, r, peakCost, linearFalloff = true, z = 0) { this.grid.addTacticalFOV(wx, wy, r, peakCost, linearFalloff, null, z); }
+
+  // #C2, #G3 & #I3: Factory helpers for CrowdSystem, SquadSystem, and Async Worker Pipeline
+  createCrowd(capacity = 4096, opts = {}) { return new CrowdSystem(this, capacity, opts); }
+  createSquadSystem(crowd = null) { return new SquadSystem(this, crowd); }
+  createAsyncPipeline(workerUrl = null) { return new AsyncPathfinderPipeline(this, workerUrl); }
+  //#endregion
+
+  //#region 37: FlowFieldPathfinder Incremental Hierarchy Rebuild (#B1)
+  decayPortalTraffic(decayFactor = 0.85) {
+    for (const entry of this.clearanceGraphs.values()) {
+      entry.graph.decayPortalTraffic(decayFactor);
+    }
+  }
+
+  rebuild() {
+    const { topology, weights, all } = this.grid.consumeDirtyState();
+    if (all.size === 0) return false;
+
+    if (topology.size > 0 && (this.grid.wallPenaltyWeight > 0 || this.grid.wallRepulsionWeight > 0)) {
+      this.grid.updateWallSDF(false);
+    }
+    if (topology.size > 0 && this.grid.clearance) {
+      this.grid.updateClearance(false);
+    }
+
+    this.cache.invalidateChunks(all);
+
+    for (const [hKey, entry] of this.clearanceGraphs) {
+      if (topology.size > 0) {
+        const nextGraph = new PortalGraph(this.grid, entry.graph, all, entry.graph.minClearance, entry.graph.profile, entry.graph.footprint);
+        const nextMacro = new MacroPathfinder(this.grid, nextGraph);
+        this.clearanceGraphs.set(hKey, { graph: nextGraph, macro: nextMacro });
+        if (hKey === this.minClearance) {
+          this.graph = nextGraph;
+          this.macro = nextMacro;
+        }
+      } else if (weights.size > 0) {
+        entry.graph.refreshWeights(weights);
+        entry.macro.invalidateChunks(weights);
+      }
+    }
+    return true;
+  }
+
+  _getHierarchy(minClearance = this.minClearance, profile = null, footprint = null) {
+    if (this.grid.dirtyChunks.size > 0) this.rebuild();
+    const hKey = this._hierarchyKey(minClearance, profile, footprint);
+    let entry = this.clearanceGraphs.get(hKey);
+    if (!entry) {
+      const graph = new PortalGraph(this.grid, null, null, minClearance, profile, footprint);
+      const macro = new MacroPathfinder(this.grid, graph);
+      entry = { graph, macro };
+      this.clearanceGraphs.set(hKey, entry);
+    }
+    return entry;
+  }
+  //#endregion
+
+  //#region 38: FlowFieldPathfinder Macro Pathfinding & Time-Sliced Work Queue (#H3, #H4, #I4)
+  /**
+   * Computes a single-goal hierarchical macro path (supports `opts.minClearance`, `opts.profile`,
+   * `opts.footprint = { width, length, turnPenalty }` (#H4), and `opts.startLayer` / `opts.goalLayer` (#H3)).
+   */
+  findPath(sx, sy, gx, gy, opts = {}) {
+    const clr = opts.minClearance ?? this.minClearance;
+    const prof = opts.profile ?? null;
+    const fp = opts.footprint ?? null;
+    const sz = clamp((opts.startLayer ?? opts.layer ?? 0) | 0, 0, this.grid.layers - 1);
+    const gz = clamp((opts.goalLayer ?? opts.layer ?? 0) | 0, 0, this.grid.layers - 1);
+    const { macro } = this._getHierarchy(clr, prof, fp);
+    const { grid } = this;
+    const scx = clamp(sx | 0, 0, grid.width - 1), scy = clamp(sy | 0, 0, grid.height - 1);
+    const gcx = clamp(gx | 0, 0, grid.width - 1), gcy = clamp(gy | 0, 0, grid.height - 1);
+    const startCell = grid.isWalkable(scx, scy, clr, prof, sz, fp) ? grid.index(scx, scy, sz) : grid.findNearestWalkable(scx, scy, 16, clr, prof, sz, fp);
+    const goalCell = grid.isWalkable(gcx, gcy, clr, prof, gz, fp) ? grid.index(gcx, gcy, gz) : grid.findNearestWalkable(gcx, gcy, 16, clr, prof, gz, fp);
+    if (startCell < 0 || goalCell < 0) return null;
+    return macro.findPath(startCell, goalCell, opts.useSuperChunks ?? this.useSuperChunks);
+  }
+
+  findMultiGoalPath(sx, sy, goals, opts = {}) {
+    const clr = opts.minClearance ?? this.minClearance;
+    const prof = opts.profile ?? null;
+    const fp = opts.footprint ?? null;
+    const sz = clamp((opts.startLayer ?? opts.layer ?? 0) | 0, 0, this.grid.layers - 1);
+    const { macro } = this._getHierarchy(clr, prof, fp);
+    const { grid } = this;
+    const scx = clamp(sx | 0, 0, grid.width - 1), scy = clamp(sy | 0, 0, grid.height - 1);
+    const startCell = grid.isWalkable(scx, scy, clr, prof, sz, fp) ? grid.index(scx, scy, sz) : grid.findNearestWalkable(scx, scy, 16, clr, prof, sz, fp);
+    if (startCell < 0) return null;
+    const validTargets = [];
+    for (const g of goals) {
+      const gx = clamp(g.x | 0, 0, grid.width - 1), gy = clamp(g.y | 0, 0, grid.height - 1);
+      const gz = clamp((g.layer ?? opts.goalLayer ?? opts.layer ?? 0) | 0, 0, grid.layers - 1);
+      const cell = grid.isWalkable(gx, gy, clr, prof, gz, fp) ? grid.index(gx, gy, gz) : grid.findNearestWalkable(gx, gy, 16, clr, prof, gz, fp);
+      if (cell >= 0) validTargets.push({ cell, weight: g.weight ?? 0 });
+    }
+    if (!validTargets.length) return null;
+    return macro.findPath(startCell, validTargets, false);
+  }
+
+  enqueuePath(sx, sy, gx, gy, opts = {}, callback = null) {
+    const priority = opts.priority ?? 0;
+    return new Promise(resolve => {
+      this._workQueue.push({
+        priority,
+        run: () => {
+          const res = Array.isArray(gx) ? this.findMultiGoalPath(sx, sy, gx, gy || {}) : this.findPath(sx, sy, gx, gy, opts);
+          if (callback) callback(res);
+          resolve(res);
+        }
+      });
+      this._workQueue.sort((a, b) => b.priority - a.priority);
+    });
+  }
+
+  processQueue(maxBudgetMs = 2.0) {
+    const now = typeof performance !== 'undefined' ? () => performance.now() : () => Date.now();
+    const t0 = now();
+    if (this.grid.dirtyChunks.size > 0) this.rebuild();
+    let processed = 0;
+    while (this._workQueue.length > 0 && (now() - t0 < maxBudgetMs || processed === 0)) {
+      const job = this._workQueue.shift();
+      job.run();
+      processed++;
+    }
+    return { processed, remaining: this._workQueue.length };
+  }
+  //#endregion
+
+  //#region 39: FlowFieldPathfinder Swarm, Vortex, Flee & Corridor Queries (#7, #8, #10, #B3)
+  createSwarmField(goals, opts = {}) {
+    const clr = opts.minClearance ?? this.minClearance;
+    const prof = opts.profile ?? null;
+    const fp = opts.footprint ?? null;
+    const { macro } = this._getHierarchy(clr, prof, fp);
+    const { grid } = this;
+    const list = Array.isArray(goals) ? goals : [goals];
+    const valid = [];
+    for (const g of list) {
+      const gx = clamp(g.x | 0, 0, grid.width - 1), gy = clamp(g.y | 0, 0, grid.height - 1);
+      const gz = clamp((g.layer ?? opts.layer ?? 0) | 0, 0, grid.layers - 1);
+      const cell = grid.isWalkable(gx, gy, clr, prof, gz, fp) ? grid.index(gx, gy, gz) : grid.findNearestWalkable(gx, gy, 16, clr, prof, gz, fp);
+      if (cell >= 0) valid.push({ cell, weight: g.weight ?? 0 });
+    }
+    if (!valid.length) return null;
+    return macro.createSwarmField(valid.length === 1 && valid[0].weight === 0 ? valid[0].cell : valid);
+  }
+
+  getFieldForSwarm(swarm, wx, wy, layer = 0) {
+    if (!swarm) return null;
+    const { graph } = this._getHierarchy(swarm.minClearance, swarm.profile, swarm.footprint);
+    if (swarm.graph !== graph) return null;
+    const { grid } = this;
+    const cx = clamp(wx | 0, 0, grid.width - 1), cy = clamp(wy | 0, 0, grid.height - 1);
+    const cz = clamp(layer | 0, 0, grid.layers - 1);
+    const chunk = grid.chunkIdAt(cx, cy, cz);
+    return this.cache.getSwarmChunkField(chunk, swarm);
+  }
+
+  sampleSwarmFlow(swarm, wx, wy, out = { x: 0, y: 0 }, layer = 0) {
+    const field = this.getFieldForSwarm(swarm, wx, wy, layer);
+    if (!field) { out.x = 0; out.y = 0; return false; }
+    const resolver = this.seamInterpolation ? (nx, ny) => {
+      if (!this.grid.inBounds(nx, ny, layer)) return null;
+      return this.cache.getSwarmChunkField(this.grid.chunkIdAt(nx, ny, layer), swarm);
+    } : null;
+    return sampleFlowBilinear(field, wx, wy, out, resolver);
+  }
+
+  getVortexField(wx, wy, opts = {}) {
+    const { grid } = this;
+    const clr = opts.minClearance ?? this.minClearance;
+    const layer = clamp((opts.layer ?? 0) | 0, 0, grid.layers - 1);
+    const { graph, macro } = this._getHierarchy(clr, opts.profile, opts.footprint);
+    const qx = clamp(wx | 0, 0, grid.width - 1), qy = clamp(wy | 0, 0, grid.height - 1);
+    const chunk = grid.chunkIdAt(qx, qy, layer);
+    const cx = clamp((opts.centerX ?? wx) | 0, 0, grid.width - 1);
+    const cy = clamp((opts.centerY ?? wy) | 0, 0, grid.height - 1);
+    return this.cache.getVortexField(chunk, grid.index(cx, cy, layer), { ...opts, graph, macro });
+  }
+
+  getFleeField(wx, wy, threatPoints, opts = {}) {
+    const { grid } = this;
+    const clr = opts.minClearance ?? this.minClearance;
+    const layer = clamp((opts.layer ?? 0) | 0, 0, grid.layers - 1);
+    const { graph } = this._getHierarchy(clr, opts.profile, opts.footprint);
+    const cx = clamp(wx | 0, 0, grid.width - 1), cy = clamp(wy | 0, 0, grid.height - 1);
+    return this.cache.getFleeField(grid.chunkIdAt(cx, cy, layer), threatPoints, { ...opts, graph });
+  }
+
+  getCorridorField(wx, wy, polyline, opts = {}) {
+    const { grid } = this;
+    const clr = opts.minClearance ?? this.minClearance;
+    const layer = clamp((opts.layer ?? 0) | 0, 0, grid.layers - 1);
+    const { graph } = this._getHierarchy(clr, opts.profile, opts.footprint);
+    const cx = clamp(wx | 0, 0, grid.width - 1), cy = clamp(wy | 0, 0, grid.height - 1);
+    return this.cache.getCorridorField(grid.chunkIdAt(cx, cy, layer), polyline, { ...opts, graph });
+  }
+  //#endregion
+
+  //#region 40: FlowFieldPathfinder Tactical Cover/Vantage & Reachable Area Queries (#E2, #E3)
+  findTacticalPosition(wx, wy, threatsOrTargets, opts = {}) {
+    const mode = opts.mode ?? 'cover';
+    const searchR = opts.searchRadius ?? 12;
+    const minClearance = opts.minClearance ?? this.minClearance;
+    const profile = opts.profile ?? null;
+    const layer = clamp((opts.layer ?? 0) | 0, 0, this.grid.layers - 1);
+    const { grid } = this, W = grid.width, H = grid.height, zOff = layer * grid.layerCells;
+    const threats = Array.isArray(threatsOrTargets) ? threatsOrTargets : [threatsOrTargets];
+    if (!threats.length) return null;
+
+    const seenByEnemy = new Uint8Array(grid.layerCells);
+    for (let i = 0; i < threats.length; i++) {
+      const t = threats[i];
+      grid.addTacticalFOV(t.x, t.y, searchR + 16, 0, false, (mx, my, idx) => {
+        seenByEnemy[idx - zOff] = 1;
+      }, layer);
+    }
+
+    const sx = clamp(wx | 0, 0, W - 1), sy = clamp(wy | 0, 0, H - 1);
+    const x0 = Math.max(0, Math.floor(sx - searchR)), x1 = Math.min(W - 1, Math.ceil(sx + searchR));
+    const y0 = Math.max(0, Math.floor(sy - searchR)), y1 = Math.min(H - 1, Math.ceil(sy + searchR));
+    const r2 = searchR * searchR;
+    const minRange = opts.minRange ?? 3.0, maxRange = opts.maxRange ?? searchR;
+    let bestScore = Infinity, bestX = -1, bestY = -1, bestCell = -1;
+
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const dAgent2 = (x + 0.5 - wx) ** 2 + (y + 0.5 - wy) ** 2;
+        if (dAgent2 > r2 || !grid.isWalkable(x, y, minClearance, profile, layer)) continue;
+        const lIdx = y * W + x, gIdx = zOff + lIdx;
+        const dAgent = Math.sqrt(dAgent2);
+        const tacPenalty = grid.hasTactical && grid.tacticalCosts ? grid.tacticalCosts[gIdx] : 0;
+
+        if (mode === 'cover') {
+          if (seenByEnemy[lIdx]) continue;
+          let adjWallBonus = 0;
+          for (let d = 0; d < 4; d++) {
+            const nx = x + DX[d], ny = y + DY[d];
+            if (!grid.inBounds(nx, ny, layer) || grid.costs[zOff + ny * W + nx] >= COST_BLOCK) adjWallBonus += 1.5;
+          }
+          const score = dAgent + tacPenalty - adjWallBonus;
+          if (score < bestScore) {
+            bestScore = score; bestX = x + 0.5; bestY = y + 0.5; bestCell = gIdx;
+          }
+        } else {
+          const t0 = threats[0];
+          const dt = Math.hypot((x + 0.5) - t0.x, (y + 0.5) - t0.y);
+          if (dt < minRange || dt > maxRange || !seenByEnemy[lIdx]) continue;
+          const score = dAgent + tacPenalty * 2.0 + Math.abs(dt - (minRange + maxRange) * 0.5) * 0.25;
+          if (score < bestScore) {
+            bestScore = score; bestX = x + 0.5; bestY = y + 0.5; bestCell = gIdx;
+          }
+        }
+      }
+    }
+
+    if (bestCell < 0) return null;
+    return { x: bestX, y: bestY, layer, cell: bestCell, score: bestScore, path: this.findPath(wx, wy, bestX, bestY, opts) };
+  }
+
+  queryReachableArea(sx, sy, maxCostBudget, opts = {}) {
+    const minClearance = opts.minClearance ?? this.minClearance;
+    const profile = opts.profile ?? null;
+    const layer = clamp((opts.layer ?? 0) | 0, 0, this.grid.layers - 1);
+    const { grid } = this, W = grid.width, zOff = layer * grid.layerCells;
+    const pTable = grid.getProfileTable(profile);
+    if (minClearance > 1 && (grid._clearanceDirty || !grid.clearance)) grid.updateClearance();
+
+    const scx = clamp(sx | 0, 0, W - 1), scy = clamp(sy | 0, 0, grid.height - 1);
+    const startCell = grid.isWalkable(scx, scy, minClearance, profile, layer)
+      ? grid.index(scx, scy, layer)
+      : grid.findNearestWalkable(scx, scy, 8, minClearance, profile, layer);
+    if (startCell < 0) return { cells: new Int32Array(0), costs: new Float32Array(0), borderCells: new Int32Array(0), getPathTo: () => null };
+
+    const distMap = new Map([[startCell, 0]]);
+    const parentMap = new Map([[startCell, -1]]);
+    const heap = new MinHeap(256);
+    heap.push(startCell, 0);
+
+    const reachedCells = [];
+    const reachedCosts = [];
+    const borderCells = [];
+
+    while (!heap.isEmpty) {
+      const u = heap.pop(), du = heap.lastKey;
+      if (du > distMap.get(u)) continue;
+      reachedCells.push(u);
+      reachedCosts.push(du);
+
+      const rem = u - zOff, ux = rem % W, uy = (rem / W) | 0;
+      const cu = grid.getEffectiveBaseCost(u, pTable);
+      let isBorder = false;
+
+      for (let d = 0; d < 8; d++) {
+        const nx = ux + DX[d], ny = uy + DY[d];
+        if (!grid.inBounds(nx, ny, layer)) { isBorder = true; continue; }
+        const v = zOff + ny * W + nx;
+        const cv = grid.getEffectiveBaseCost(v, pTable);
+        if (cv >= COST_BLOCK || (minClearance > 1 && grid.clearance[v] < minClearance)) {
+          isBorder = true; continue;
+        }
+        if (d >= 4 && (grid.getEffectiveBaseCost(zOff + uy * W + nx, pTable) >= COST_BLOCK || grid.getEffectiveBaseCost(zOff + ny * W + ux, pTable) >= COST_BLOCK)) {
+          continue;
+        }
+        const step = DL[d] * ((cu + cv) * 0.5 / COST_OPEN);
+        const nd = du + step;
+        if (nd > maxCostBudget) {
+          isBorder = true;
+          continue;
+        }
+        const prev = distMap.get(v);
+        if (prev === undefined || nd < prev) {
+          distMap.set(v, nd);
+          parentMap.set(v, u);
+          heap.push(v, nd);
+        }
+      }
+      if (isBorder) borderCells.push(u);
+    }
+
+    return {
+      cells: new Int32Array(reachedCells),
+      costs: new Float32Array(reachedCosts),
+      borderCells: new Int32Array(borderCells),
+      costMap: distMap,
+      getPathTo: (tx, ty) => {
+        const tCell = zOff + (ty | 0) * W + (tx | 0);
+        if (!parentMap.has(tCell)) return null;
+        const trace = [];
+        for (let cur = tCell; cur !== -1; cur = parentMap.get(cur) ?? -1) {
+          const cRem = cur - zOff;
+          trace.push({ x: (cRem % W) + 0.5, y: ((cRem / W) | 0) + 0.5, layer, cell: cur });
+        }
+        return trace.reverse();
+      }
+    };
+  }
+  //#endregion
+
+  //#region 41: FlowFieldPathfinder Path Flow & Adaptive Formation Sampling (#A3, #C4, #F5)
+  _resolveStepField(path, graph, stepIdx) {
+    const chunk = path.chunks[stepIdx];
+    const clr = path.minClearance ?? this.minClearance;
+    const prof = path.profile ?? null;
+    if (stepIdx >= path.portals.length) {
+      return this.cache.getGoalField(chunk, path.goalCell, clr, prof);
+    }
+    const p = graph.portals[path.portals[stepIdx]];
+    let nextField = null, nextTid = 0;
+    if (this.portalLookahead && stepIdx + 1 < path.chunks.length) {
+      const nextChunk = path.chunks[stepIdx + 1];
+      if (stepIdx + 1 < path.portals.length) {
+        const nextP = graph.portals[path.portals[stepIdx + 1]];
+        nextTid = nextP.uid;
+        nextField = this.cache.getPortalField(nextChunk, nextP, clr, null, 0, prof);
+      } else {
+        nextTid = path.goalCell + 1;
+        nextField = this.cache.getGoalField(nextChunk, path.goalCell, clr, prof);
+      }
+    }
+    const fx = path.funnelX ? path.funnelX[stepIdx] : undefined;
+    const fy = path.funnelY ? path.funnelY[stepIdx] : undefined;
+    return this.cache.getPortalField(chunk, p, clr, nextField, nextTid, prof, fx, fy);
+  }
+
+  getFieldForPath(path, wx, wy, hintIdx = 0, layer = null) {
+    if (!path) return null;
+    const clr = path.minClearance ?? this.minClearance;
+    const prof = path.profile ?? null;
+    const fp = path.footprint ?? null;
+    const { graph } = this._getHierarchy(clr, prof, fp);
+    if (path.graph !== graph) return null;
+    const { grid } = this;
+    const cx = clamp(wx | 0, 0, grid.width - 1), cy = clamp(wy | 0, 0, grid.height - 1);
+    const localIdx = (cy % CS) * CS + (cx % CS);
+
+    // If layer is not explicitly passed, infer from hintIdx chunk's layer if valid
+    const inferredZ = layer !== null ? clamp(layer | 0, 0, grid.layers - 1)
+      : (hintIdx >= 0 && hintIdx < path.chunks.length ? grid.chunkLayer(path.chunks[hintIdx]) : 0);
+    const chunk = grid.chunkIdAt(cx, cy, inferredZ);
+
+    if (hintIdx >= 0 && hintIdx < path.chunks.length && path.chunks[hintIdx] === chunk) {
+      const f = this._resolveStepField(path, graph, hintIdx);
+      if (f.integration[localIdx] < Infinity) return { field: f, chunkIndex: hintIdx, layer: inferredZ };
+    }
+
+    for (let i = Math.max(0, hintIdx); i < path.chunks.length; i++) {
+      const c = path.chunks[i];
+      if (c === chunk || (layer === null && (c % grid.layerChunks) === (chunk % grid.layerChunks))) {
+        const f = this._resolveStepField(path, graph, i);
+        if (f.integration[localIdx] < Infinity) return { field: f, chunkIndex: i, layer: grid.chunkLayer(c) };
+      }
+    }
+    for (let i = Math.min(path.chunks.length - 1, hintIdx - 1); i >= 0; i--) {
+      const c = path.chunks[i];
+      if (c === chunk || (layer === null && (c % grid.layerChunks) === (chunk % grid.layerChunks))) {
+        const f = this._resolveStepField(path, graph, i);
+        if (f.integration[localIdx] < Infinity) return { field: f, chunkIndex: i, layer: grid.chunkLayer(c) };
+      }
+    }
+    return null;
+  }
+
+  sampleFlow(path, wx, wy, out = { x: 0, y: 0 }, hintIdx = 0, layer = null) {
+    const res = this.getFieldForPath(path, wx, wy, hintIdx, layer);
+    if (!res) { out.x = 0; out.y = 0; return false; }
+    const activeLayer = res.layer;
+    const resolver = this.seamInterpolation ? (nx, ny) => {
+      if (!this.grid.inBounds(nx, ny, activeLayer)) return null;
+      const nRes = this.getFieldForPath(path, nx, ny, res.chunkIndex, activeLayer);
+      return nRes ? nRes.field : null;
+    } : null;
+    return sampleFlowBilinear(res.field, wx, wy, out, resolver);
+  }
+
+  sampleFormationFlow(pathOrSwarm, leaderX, leaderY, slotForward, slotRight, agentX, agentY, out = { x: 0, y: 0 }, opts = {}) {
+    const { grid, _tmpVec } = this;
+    const layer = clamp((opts.layer ?? 0) | 0, 0, grid.layers - 1);
+    const isSwarm = pathOrSwarm && pathOrSwarm.isSwarm;
+    const okLeader = isSwarm
+      ? this.sampleSwarmFlow(pathOrSwarm, leaderX, leaderY, _tmpVec, layer)
+      : this.sampleFlow(pathOrSwarm, leaderX, leaderY, _tmpVec, opts.leaderHintIdx ?? 0, layer);
+    const lfx = okLeader ? _tmpVec.x : 1, lfy = okLeader ? _tmpVec.y : 0;
+
+    if (grid._clearanceDirty || !grid.clearance) grid.updateClearance();
+    const lCell = grid.index(clamp(leaderX | 0, 0, grid.width - 1), clamp(leaderY | 0, 0, grid.height - 1), layer);
+    const localClr = grid.clearance[lCell];
+    const formRadius = opts.formationRadius ?? Math.max(1.5, Math.abs(slotRight));
+    const scale = clamp(localClr / formRadius, opts.minCompression ?? 0.2, 1.0);
+
+    const rightX = -lfy, rightY = lfx;
+    const targetX = leaderX + lfx * slotForward + rightX * (slotRight * scale);
+    const targetY = leaderY + lfy * slotForward + rightY * (slotRight * scale);
+
+    const okAgent = isSwarm
+      ? this.sampleSwarmFlow(pathOrSwarm, agentX, agentY, out, layer)
+      : this.sampleFlow(pathOrSwarm, agentX, agentY, out, opts.agentHintIdx ?? 0, layer);
+    const afx = okAgent ? out.x : lfx, afy = okAgent ? out.y : lfy;
+
+    const dx = targetX - agentX, dy = targetY - agentY, dist = Math.hypot(dx, dy);
+    const springW = clamp(dist * (opts.slotGain ?? 0.6), 0, opts.maxSlotWeight ?? 1.25);
+    const sx = dist > 1e-4 ? (dx / dist) * springW : 0;
+    const sy = dist > 1e-4 ? (dy / dist) * springW : 0;
+
+    const bx = afx + sx, by = afy + sy, bl = Math.hypot(bx, by);
+    if (bl < 1e-6) { out.x = 0; out.y = 0; return false; }
+    out.x = bx / bl; out.y = by / bl;
+    return true;
+  }
+  //#endregion
+}
+
+export default FlowFieldPathfinder;
