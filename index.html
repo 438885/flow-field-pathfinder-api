@@ -868,40 +868,52 @@
         update(dt) {}
       },
 
-      {
+{
         name: 'Stage 8: Anisotropic Corridor Clearance (clearanceX vs clearanceY)',
-        desc: 'Agent pilots an elongated 1x5 spire-sled (footprint: { width: 1, length: 5, turnPenalty: 6 }). Even where isotropic clearance is 1, updateClearance() tracks directional corridor spans (clearanceX, clearanceY) to allow straight passage along 1-cell rails while forbidding tight turns except inside wide turning plazas.',
+        desc: 'Agent pilots an elongated 1x3 spire-sled (footprint: { width: 1, length: 3, turnPenalty: 5 }). Even where isotropic clearance is 1, updateClearance() tracks directional corridor spans (clearanceX, clearanceY) to allow straight passage along 1-cell rails while forbidding tight turns except inside wide turning plazas.',
         features: [
           'grid.updateClearance() -> clearanceX (E-W), clearanceY (N-S)',
-          'footprint: { width: 1, length: 5, turnPenalty: 6.0 }',
+          'footprint: { width: 1, length: 3, turnPenalty: 5.0 }',
           'ChunkIntegrator.prepareChunk() heading mask & turnPenaltyCell'
         ],
         setup() {
           grid = new GridWorld(CX, CY);
+          // Fill entire map with walls, then carve 8x8 turning plazas linked by 1-cell-wide rails
           grid.setRect(0, 0, 48, 32, COST_BLOCK);
 
-          grid.setRect(2, 13, 6, 6, COST_OPEN);
+          // Start Plaza (8x8 at x=2..9, y=12..19)
+          grid.setRect(2, 12, 8, 8, COST_OPEN);
 
-          // Upper decoy slot: short 1x3 dead-end chicane (fails length >= 5 check)
-          grid.setRect(8, 14, 10, 1, COST_OPEN);
-          grid.setRect(18, 12, 1, 3, COST_OPEN);
-          grid.setRect(18, 12, 12, 1, COST_OPEN);
+          // Upper decoy shortcut: 1-cell doglegs with only 2-cell axial run-out (clearanceX/Y < 3 -> rejected!)
+          grid.setRect(10, 15, 8, 1, COST_OPEN);
+          grid.setRect(18, 14, 1, 2, COST_OPEN); // Only 2 cells N-S: CY=1, CX=1 -> impassable for length 3!
+          grid.setRect(18, 14, 12, 1, COST_OPEN);
 
-          // Valid route: long N-S & E-W 1-cell rail trenches connected by 5x5 turning bays
-          grid.setRect(4, 19, 1, 9, COST_OPEN);
-          grid.setRect(2, 25, 6, 5, COST_OPEN);
-          grid.setRect(8, 27, 20, 1, COST_OPEN);
-          grid.setRect(27, 24, 6, 6, COST_OPEN);
-          grid.setRect(30, 5, 1, 19, COST_OPEN);
-          grid.setRect(28, 3, 6, 5, COST_OPEN);
-          grid.setRect(34, 5, 10, 1, COST_OPEN);
-          grid.setRect(41, 3, 5, 6, COST_OPEN);
+          // Valid Route Segment 1: 1-cell N-S rail at x=5 (continuous y=12..29 so CY >= 3 everywhere along rail)
+          grid.setRect(5, 12, 1, 18, COST_OPEN);
+          // Bottom-Left Turning Plaza (8x8 at x=2..9, y=22..29)
+          grid.setRect(2, 22, 8, 8, COST_OPEN);
+
+          // Valid Route Segment 2: 1-cell E-W rail at y=26 (continuous x=2..34 so CX >= 3 everywhere along rail)
+          grid.setRect(2, 26, 33, 1, COST_OPEN);
+          // Bottom-Mid Turning Plaza (8x8 at x=27..34, y=22..29)
+          grid.setRect(27, 22, 8, 8, COST_OPEN);
+
+          // Valid Route Segment 3: 1-cell N-S rail at x=30 (continuous y=3..29 so CY >= 3 everywhere along rail)
+          grid.setRect(30, 3, 1, 27, COST_OPEN);
+          // Top-Mid Turning Plaza (8x8 at x=27..34, y=3..10)
+          grid.setRect(27, 3, 8, 8, COST_OPEN);
+
+          // Valid Route Segment 4: 1-cell E-W rail at y=6 (continuous x=27..45 so CX >= 3 everywhere along rail)
+          grid.setRect(27, 6, 19, 1, COST_OPEN);
+          // Goal Plaza (8x8 at x=38..45, y=3..10)
+          grid.setRect(38, 3, 8, 8, COST_OPEN);
 
           grid.updateClearance(true);
 
-          const footprint = { width: 1, length: 5, turnPenalty: 6.0 };
-          Object.assign(agent, { x: 4.5, y: 15.5, z: 0, vx: 0, vy: 0, profile: null, minClearance: 1, footprint, trail: [] });
-          goal = { x: 43.5, y: 5.5, z: 0 };
+          const footprint = { width: 1, length: 3, turnPenalty: 5.0 };
+          Object.assign(agent, { x: 5.5, y: 15.5, z: 0, vx: 0, vy: 0, profile: null, minClearance: 1, footprint, trail: [] });
+          goal = { x: 41.5, y: 6.5, z: 0 };
         },
         update(dt) {}
       },
@@ -1585,13 +1597,13 @@
         }
       },
 
-      {
+{
         name: 'Stage 20: Sniper Raycast Lock-On & Hard-Edge Step Domes',
-        desc: 'Two sniper turrets continuously execute grid.raycast(tx, ty, agent.x, agent.y) to test line-of-sight. Whenever ray.hit is false (agent exposed!), the turret scorches the line-of-fire with tactical discs, forcing the agent to hop between shadow monoliths while skirting hard-edge step domes (linearFalloff: false).',
+        desc: 'Two sniper turrets project shadowcasted threat zones (addTacticalFOV) and execute grid.raycast(tx, ty, agent.x, agent.y) each frame to test line-of-sight. Opaque monoliths cast safe shadow corridors while hard-edge step domes (linearFalloff: false) block direct bypasses.',
         features: [
-          'Turret LOS detection via grid.raycast(tx, ty, ax, ay)',
+          'Turret LOS lock detection via grid.raycast(tx, ty, ax, ay)',
           'Step-function hazard domes: addTacticalDisc(..., linearFalloff = false)',
-          'Dynamic cover-hopping behavior under active fire'
+          'Shadow-hopping cover navigation under active turret watch'
         ],
         setup() {
           grid = new GridWorld(CX, CY);
@@ -1600,21 +1612,23 @@
           grid.setRect(0, 0, 1, 32, COST_BLOCK);
           grid.setRect(47, 0, 1, 32, COST_BLOCK);
 
-          grid.setRect(10, 11, 3, 4, COST_BLOCK);
-          grid.setRect(16, 18, 3, 4, COST_BLOCK);
-          grid.setRect(22, 9, 4, 4, COST_BLOCK);
-          grid.setRect(28, 19, 4, 4, COST_BLOCK);
-          grid.setRect(35, 11, 3, 4, COST_BLOCK);
+          // Cover monoliths that cast shadow corridors against the upper & lower sniper turrets
+          grid.setRect(11, 9, 4, 3, COST_BLOCK);
+          grid.setRect(18, 20, 4, 3, COST_BLOCK);
+          grid.setRect(25, 9, 4, 3, COST_BLOCK);
+          grid.setRect(32, 20, 4, 3, COST_BLOCK);
+
+          grid.enableWallRepulsion({ penaltyWeight: 1.4, repulsionWeight: 0.25, radius: 2.0 });
 
           stageState = {
             turrets: [
-              { x: 20.5, y: 2.5, ray: null, locked: false },
-              { x: 30.5, y: 29.5, ray: null, locked: false }
+              { x: 20.0, y: 2.5, r: 22, ray: null, locked: false },
+              { x: 27.0, y: 29.5, r: 22, ray: null, locked: false }
             ],
             stepDomes: [
-              { x: 14.0, y: 8.0, r: 3.2 },
-              { x: 25.0, y: 22.0, r: 3.4 },
-              { x: 36.0, y: 21.0, r: 3.2 }
+              { x: 13.0, y: 22.0, r: 3.0 },
+              { x: 23.5, y: 16.0, r: 2.8 },
+              { x: 34.0, y: 9.5, r: 3.0 }
             ]
           };
 
@@ -1625,23 +1639,23 @@
         update(dt) {
           grid.clearTacticalCosts();
 
+          // 1. Stamp hard-edge step domes (linearFalloff = false) (#6)
           for (const dome of stageState.stepDomes) {
-            grid.addTacticalDisc(dome.x, dome.y, dome.r, 55, false, 0);
+            grid.addTacticalDisc(dome.x, dome.y, dome.r, 48, false, 0);
           }
 
+          // 2. Project turret FOV threat & execute LOS raycast toward Agent-01 (#E1)
           for (const t of stageState.turrets) {
-            const ray = grid.raycast(t.x, t.y, agent.x, agent.y, { maxCost: COST_BLOCK });
+            grid.addTacticalFOV(t.x, t.y, t.r, 26, true, null, 0);
+            const ray = grid.raycast(t.x, t.y, agent.x, agent.y, { maxCost: COST_BLOCK - 1 });
             t.ray = ray;
             t.locked = !ray.hit;
 
+            // If agent is exposed in open LOS, add suppression penalty at turret origin/sightline
             if (t.locked) {
-              const steps = Math.max(2, Math.ceil(ray.distance / 1.5));
-              for (let s = 1; s <= steps; s++) {
-                const u = s / steps;
-                const bx = t.x + (agent.x - t.x) * u;
-                const by = t.y + (agent.y - t.y) * u;
-                grid.addTacticalDisc(bx, by, 2.2, 65, true, 0);
-              }
+              const mx = t.x + (agent.x - t.x) * 0.5;
+              const my = t.y + (agent.y - t.y) * 0.5;
+              grid.addTacticalDisc(mx, my, 2.5, 22, true, 0);
             }
           }
 
@@ -1655,7 +1669,7 @@
         features: [
           'Dynamic topology cave-ins via grid.setDisc(x, y, r, COST_BLOCK)',
           'Spiral Manhattan ring search: grid.findNearestWalkable()',
-          'grid.consumeDirtyChunks() & incremental SDF/Clearance updates'
+          'grid.consumeDirtyChunks() Set inspection & incremental SDF/Clearance'
         ],
         setup() {
           grid = new GridWorld(CX, CY);
@@ -1664,12 +1678,12 @@
           grid.setRect(0, 0, 1, 32, COST_BLOCK);
           grid.setRect(47, 0, 1, 32, COST_BLOCK);
 
-          grid.enableWallRepulsion({ penaltyWeight: 2.0, repulsionWeight: 0.4, radius: 2.5 });
+          grid.enableWallRepulsion({ penaltyWeight: 1.8, repulsionWeight: 0.35, radius: 2.5 });
           grid.updateClearance(true);
           grid.consumeDirtyChunks();
 
           stageState = {
-            quakeTimer: 0.9,
+            quakeTimer: 0.85,
             quakecount: 0,
             lastDirtyChunks: [],
             rescues: 0,
@@ -1681,26 +1695,34 @@
         },
         update(dt) {
           stageState.quakeTimer -= dt;
-          if (stageState.quakeTimer <= 0 && stageState.quakecount < 12) {
-            stageState.quakeTimer = 1.15;
+          if (stageState.quakeTimer <= 0 && stageState.quakecount < 10) {
+            stageState.quakeTimer = 1.1;
             stageState.quakecount++;
 
-            const targetGoal = stageState.quakecount % 4 === 0;
-            const rx = targetGoal
-              ? goal.x + (Math.sin(stageState.quakecount * 3.1) * 1.5)
-              : clamp(agent.x + 4.5 + Math.cos(stageState.quakecount * 2.3) * 2.0, 8, 39);
-            const ry = targetGoal
-              ? goal.y + (Math.cos(stageState.quakecount * 2.7) * 1.5)
-              : clamp(agent.y + Math.sin(stageState.quakecount * 1.9) * 3.5, 4, 27);
-            const rad = 2.1;
+            // Alternate between dropping rockfalls directly on the agent/goal (to trigger findNearestWalkable)
+            // and ahead of the agent along the cavern
+            let rx, ry;
+            if (stageState.quakecount === 2 || stageState.quakecount === 6) {
+              rx = agent.x;
+              ry = agent.y;
+            } else if (stageState.quakecount === 4 || stageState.quakecount === 8) {
+              rx = goal.x;
+              ry = goal.y;
+            } else {
+              rx = clamp(agent.x + 5.0, 9, 38);
+              ry = clamp(16.0 + Math.sin(stageState.quakecount * 2.1) * 6.5, 5, 26);
+            }
+            const rad = 2.0;
 
             grid.setDisc(rx, ry, rad, COST_BLOCK, 0);
             stageState.rubbleSites.push({ x: rx, y: ry, r: rad });
 
             grid.updateWallSDF(false);
             grid.updateClearance(false);
-            stageState.lastDirtyChunks = grid.consumeDirtyChunks();
+            // consumeDirtyChunks() returns a Set -> convert to Array for HUD display (#B1)
+            stageState.lastDirtyChunks = Array.from(grid.consumeDirtyChunks());
 
+            // If agent was buried by the cave-in, spiral-rescue via findNearestWalkable (#15)
             if (!grid.isWalkable(agent.x | 0, agent.y | 0, 1, null, 0)) {
               const safeAgentIdx = grid.findNearestWalkable(agent.x, agent.y, 16, 1, null, 0);
               if (safeAgentIdx >= 0) {
@@ -1710,6 +1732,7 @@
               }
             }
 
+            // If goal was buried by the cave-in, spiral-rescue the goal beacon
             if (!grid.isWalkable(goal.x | 0, goal.y | 0, 1, null, 0)) {
               const safeGoalIdx = grid.findNearestWalkable(goal.x, goal.y, 16, 1, null, 0);
               if (safeGoalIdx >= 0) {
@@ -1720,16 +1743,25 @@
             }
 
             rebuildStageField();
+
+            // Safety check: if rubble ever seals off connectivity, carve an emergency relief channel
+            const aIdx = grid.index(clamp(agent.x | 0, 0, grid.width - 1), clamp(agent.y | 0, 0, grid.height - 1), 0);
+            if (!Number.isFinite(field.integration[aIdx])) {
+              grid.setRect(4, 15, 40, 2, COST_OPEN, 0);
+              grid.updateWallSDF(false);
+              grid.updateClearance(false);
+              rebuildStageField();
+            }
           }
         }
       },
 
       {
         name: 'Stage 22: Canal Locks, Dirty Cluster Merging & Portal Side Cells',
-        desc: 'Alternating canal floodgates open and close across a deep-water channel. Before flushing dirty state, grid._buildDirtyClusters() merges nearby dirty chunks into padded bounding boxes, while portalSideCells() and grid.chunkOf() highlight the active chunk-border cells ahead of the agent.',
+        desc: 'Alternating canal floodgates open and close across a central barrier. Before flushing dirty state, grid._buildDirtyClusters() merges dirty chunks into padded bounding boxes, while portalSideCells() and grid.chunkIdAt() highlight the active chunk-border cells.',
         features: [
-          'grid._buildDirtyClusters(dirtySet, padCells, mergeGap) (#F3)',
-          'portalSideCells(portal, chunkId) & grid.chunkOf(x, y, z)',
+          'grid._buildDirtyClusters(dirtyChunkSet, halo, isFull, layer) (#F3)',
+          'portalSideCells(portal, chunkId) & grid.chunkIdAt(x, y, z)',
           'Alternating floodgate locks with incremental SDF/Clearance'
         ],
         setup() {
@@ -1739,9 +1771,11 @@
           grid.setRect(0, 0, 1, 32, COST_BLOCK);
           grid.setRect(47, 0, 1, 32, COST_BLOCK);
 
-          grid.setRect(21, 1, 6, 5, COST_BLOCK);
-          grid.setRect(21, 10, 6, 12, COST_BLOCK);
-          grid.setRect(21, 26, 6, 5, COST_BLOCK);
+          // Central canal bulkhead at x=21..25 (inside middle column of chunks x=16..31)
+          // North Lock chamber at y=5..8 (Chunk 1), South Lock chamber at y=23..26 (Chunk 4)
+          grid.setRect(21, 1, 5, 4, COST_BLOCK);
+          grid.setRect(21, 9, 5, 14, COST_BLOCK);
+          grid.setRect(21, 27, 5, 4, COST_BLOCK);
 
           grid.enableWallRepulsion({ penaltyWeight: 1.8, repulsionWeight: 0.35, radius: 2.5 });
           grid.updateClearance(true);
@@ -1760,10 +1794,12 @@
         },
         toggleLocks(openNorth) {
           stageState.northOpen = openNorth;
-          grid.setRect(21, 6, 6, 4, openNorth ? COST_OPEN : COST_BLOCK);
-          grid.setRect(21, 22, 6, 4, openNorth ? COST_BLOCK : COST_OPEN);
+          // Mutate North Lock (Chunk 1) and South Lock (Chunk 4)
+          grid.setRect(21, 5, 5, 4, openNorth ? COST_OPEN : COST_BLOCK);
+          grid.setRect(21, 23, 5, 4, openNorth ? COST_BLOCK : COST_OPEN);
 
-          stageState.clusters = grid._buildDirtyClusters(grid.topologyDirtyChunks, 3, 4);
+          // Compute localized dirty cluster bounding boxes (isFull = false) before consuming (#F3)
+          stageState.clusters = grid._buildDirtyClusters(grid.topologyDirtyChunks, 2, false, 0);
           grid.updateWallSDF(false);
           grid.updateClearance(false);
           grid.consumeDirtyState();
@@ -1776,7 +1812,12 @@
             this.toggleLocks(!stageState.northOpen);
           }
 
-          const agentChunk = grid.chunkOf(clamp(agent.x | 0, 0, grid.width - 1), clamp(agent.y | 0, 0, grid.height - 1), agent.z);
+          // Use grid.chunkIdAt(x, y, z) to find agent's chunk and highlight its portalSideCells (#A2)
+          const agentChunk = grid.chunkIdAt(
+            clamp(agent.x | 0, 0, grid.width - 1),
+            clamp(agent.y | 0, 0, grid.height - 1),
+            agent.z
+          );
           const sideCells = [];
           for (const p of portals) {
             if (p.chunkA === agentChunk || p.chunkB === agentChunk) {
@@ -1807,7 +1848,7 @@
     // -------------------------------------------------------------------------
     // Single-Agent Physics & Flow-Field Steering Step
     // -------------------------------------------------------------------------
-    function stepAgent(dt) {
+function stepAgent(dt) {
       const W = grid.width, H = grid.height, LC = grid.layerCells;
       const cellX = clamp(Math.floor(agent.x), 0, W - 1);
       const cellY = clamp(Math.floor(agent.y), 0, H - 1);
@@ -1824,10 +1865,11 @@
         agent.trail.push({ x: agent.x, y: agent.y, z: agent.z });
       }
 
-      // Line-of-Sight raycast check (#E1) when on the same layer as the goal
+      // Line-of-Sight raycast shortcut (#E1) only when no tactical/anisotropic/footprint constraints apply
       let dirX = 0, dirY = 0;
       const distToGoal = Math.hypot(goal.x - agent.x, goal.y - agent.y);
-      if (agent.z === goal.z && distToGoal < 14) {
+      const canUseDirectLOS = !grid.hasTactical && !grid.hasAnisotropy && !grid.hasDynamicObstacles && !agent.footprint;
+      if (canUseDirectLOS && agent.z === goal.z && distToGoal < 14) {
         const ray = grid.raycast(agent.x, agent.y, goal.x, goal.y, {
           layer: agent.z,
           minClearance: agent.minClearance,
@@ -1846,7 +1888,12 @@
         dirX = field.flowX[curIdx];
         dirY = field.flowY[curIdx];
 
-        if (dirX === 0 && dirY === 0) {
+        // If on a cell whose gradient is zero or points into a blocked neighbor, aim at best walkable neighbor center
+        const nextCellX = clamp(Math.floor(agent.x + dirX * 0.6), 0, W - 1);
+        const nextCellY = clamp(Math.floor(agent.y + dirY * 0.6), 0, H - 1);
+        const nextBlocked = field.cellBlocked[grid.index(nextCellX, nextCellY, agent.z)];
+
+        if ((dirX === 0 && dirY === 0) || nextBlocked) {
           let bestIdx = -1, bestD = field.integration[curIdx];
           const zOff = agent.z * LC;
           const cx = clamp(Math.floor(agent.x), 0, W - 1);
@@ -1855,6 +1902,8 @@
             const nx = cx + DX[d], ny = cy + DY[d];
             if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
             const nIdx = zOff + ny * W + nx;
+            if (field.cellBlocked[nIdx]) continue;
+            if (d >= 4 && (field.cellBlocked[zOff + cy * W + nx] || field.cellBlocked[zOff + ny * W + cx])) continue;
             if (field.integration[nIdx] < bestD) {
               bestD = field.integration[nIdx];
               bestIdx = nIdx;
@@ -1870,7 +1919,16 @@
         }
       }
 
-      const blend = Math.min(1, dt * 10);
+      // Gentle rail-centering when navigating 1-cell-wide anisotropic clearance trenches
+      if (agent.footprint && grid.clearance && grid.clearance[cellIdx] === 1) {
+        if (Math.abs(dirX) > 0.8) dirY += (cellY + 0.5 - agent.y) * 2.5;
+        if (Math.abs(dirY) > 0.8) dirX += (cellX + 0.5 - agent.x) * 2.5;
+        const nl = Math.hypot(dirX, dirY) || 1;
+        dirX /= nl;
+        dirY /= nl;
+      }
+
+      const blend = Math.min(1, dt * 12);
       agent.vx += (dirX * agent.speed - agent.vx) * blend;
       agent.vy += (dirY * agent.speed - agent.vy) * blend;
 
@@ -1891,8 +1949,8 @@
           agent.y = tryY;
           agent.vx *= 0.2;
         } else {
-          agent.x += (cellX + 0.5 - agent.x) * 0.25;
-          agent.y += (cellY + 0.5 - agent.y) * 0.25;
+          agent.x += (cellX + 0.5 - agent.x) * 0.3;
+          agent.y += (cellY + 0.5 - agent.y) * 0.3;
         }
       }
 
@@ -2333,7 +2391,7 @@
         );
       }
 
-      if (currentStageIdx === 20 && stageState.rubbleSites) {
+if (currentStageIdx === 20 && stageState.rubbleSites) {
         for (const cid of stageState.lastDirtyChunks) {
           const ox = grid.chunkOriginX(cid) * CELL_PX, oy = grid.chunkOriginY(cid) * CELL_PX;
           ctx.strokeStyle = 'rgba(240, 136, 62, 0.65)';
@@ -2348,7 +2406,7 @@
           ctx.stroke();
         }
         drawHudBanner(
-          `Cave-Ins: ${stageState.quakecount}/12 | consumeDirtyChunks(): [${stageState.lastDirtyChunks.join(', ')}] | Spiral Rescues: ${stageState.rescues}`,
+          `Cave-Ins: ${stageState.quakecount}/10 | consumeDirtyChunks(): [${stageState.lastDirtyChunks.join(', ')}] | Spiral Rescues: ${stageState.rescues}`,
           '#e3b341'
         );
       }
@@ -2358,7 +2416,12 @@
           ctx.strokeStyle = '#39c5bb';
           ctx.lineWidth = 1.8;
           ctx.setLineDash([5, 3]);
-          ctx.strokeRect(cl.x0 * CELL_PX, cl.y0 * CELL_PX, (cl.x1 - cl.x0) * CELL_PX, (cl.y1 - cl.y0) * CELL_PX);
+          ctx.strokeRect(
+            cl.x0 * CELL_PX,
+            cl.y0 * CELL_PX,
+            (cl.x1 - cl.x0 + 1) * CELL_PX,
+            (cl.y1 - cl.y0 + 1) * CELL_PX
+          );
           ctx.setLineDash([]);
         }
         ctx.fillStyle = 'rgba(63, 185, 80, 0.55)';
@@ -2366,9 +2429,9 @@
           const sx = (cellIdx % W) * CELL_PX, sy = ((cellIdx / W) | 0) * CELL_PX;
           ctx.fillRect(sx + 3, sy + 3, CELL_PX - 6, CELL_PX - 6);
         }
-        const curChunk = grid.chunkOf(clamp(agent.x | 0, 0, W - 1), clamp(agent.y | 0, 0, H - 1), agent.z);
+        const curChunk = grid.chunkIdAt(clamp(agent.x | 0, 0, W - 1), clamp(agent.y | 0, 0, H - 1), agent.z);
         drawHudBanner(
-          `Agent Chunk: #${curChunk} | _buildDirtyClusters(): ${stageState.clusters.length} merged rect(s) | Active Lock: ${stageState.northOpen ? 'NORTH' : 'SOUTH'}`,
+          `Agent Chunk: #${curChunk} | _buildDirtyClusters(): ${stageState.clusters.length} local rect(s) | Active Lock: ${stageState.northOpen ? 'NORTH' : 'SOUTH'}`,
           '#56d4dd'
         );
       }
