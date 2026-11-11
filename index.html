@@ -115,7 +115,7 @@
 
   <script type="module">
     import {
-      FlowFieldCore, GridWorld, PortalGraph, ChunkIntegrator,
+      FlowFieldCore, Grid, PortalGraph, ChunkIntegrator,
       CS, CC, COST_OPEN, COST_BLOCK, DIR_FLAGS, QUANT_I_INF, QUANT_I_SCALE,
       hasWorldLOS
     } from './flow-field-pathfinder-api-core.js';
@@ -234,7 +234,7 @@
       const oddSeq = (sim.grid.chunkSeq[0] & 1) === 1;
       sim.grid.endChunkWrite(0);
       const evenSeq = (sim.grid.chunkSeq[0] & 1) === 0;
-      const hydrated = GridWorld.fromSharedDescriptor(sim.grid.toSharedDescriptor());
+      const hydrated = Grid.fromSharedDescriptor(sim.grid.toSharedDescriptor());
       assert(oddSeq && evenSeq && hydrated.width === sim.width, '5.2 Seqlock & Worker Hydration', `(seq=${sim.grid.chunkSeq[0]})`);
     }
     //#endregion
